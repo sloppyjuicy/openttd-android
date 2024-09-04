@@ -35,10 +35,7 @@ static const NWidgetPart _nested_errmsg_widgets[] = {
 		NWidget(WWT_CAPTION, COLOUR_RED, WID_EM_CAPTION), SetDataTip(STR_ERROR_MESSAGE_CAPTION, STR_NULL),
 	EndContainer(),
 	NWidget(WWT_PANEL, COLOUR_RED),
-		NWidget(WWT_TEXT, COLOUR_RED), SetDataTip(STR_EMPTY, STR_NULL), // Add some borders
-		NWidget(WWT_EMPTY, COLOUR_RED, WID_EM_MESSAGE), SetPadding(4, 4, 4, 4), SetMinimalSize(236, 32),
-		NWidget(WWT_TEXT, COLOUR_RED), SetDataTip(STR_EMPTY, STR_NULL),
-		NWidget(WWT_PUSHTXTBTN, COLOUR_RED, WID_EM_CLOSE), SetPadding(4, 4, 4, 4), SetDataTip(STR_BUTTON_OK, STR_NULL),
+		NWidget(WWT_EMPTY, COLOUR_RED, WID_EM_MESSAGE), SetPadding(WidgetDimensions::unscaled.modalpopup), SetFill(1, 0), SetMinimalSize(236, 0),
 	EndContainer(),
 };
 
@@ -55,13 +52,10 @@ static const NWidgetPart _nested_errmsg_face_widgets[] = {
 		NWidget(WWT_CAPTION, COLOUR_RED, WID_EM_CAPTION), SetDataTip(STR_ERROR_MESSAGE_CAPTION_OTHER_COMPANY, STR_NULL),
 	EndContainer(),
 	NWidget(WWT_PANEL, COLOUR_RED),
-		NWidget(WWT_TEXT, COLOUR_RED), SetDataTip(STR_EMPTY, STR_NULL), // Add some borders
-		NWidget(NWID_HORIZONTAL), SetPIP(2, 1, 2),
-			NWidget(WWT_EMPTY, COLOUR_RED, WID_EM_FACE), SetMinimalSize(92, 119), SetFill(0, 1), SetPadding(4, 4, 4, 4),
-			NWidget(WWT_EMPTY, COLOUR_RED, WID_EM_MESSAGE), SetFill(0, 1), SetMinimalSize(238, 123), SetPadding(4, 4, 4, 4),
+		NWidget(NWID_HORIZONTAL),
+			NWidget(WWT_EMPTY, COLOUR_RED, WID_EM_FACE), SetPadding(2, 0, 2, 2), SetFill(0, 1), SetMinimalSize(92, 119),
+			NWidget(WWT_EMPTY, COLOUR_RED, WID_EM_MESSAGE), SetPadding(WidgetDimensions::unscaled.modalpopup), SetFill(1, 1), SetMinimalSize(236, 0),
 		EndContainer(),
-		NWidget(WWT_TEXT, COLOUR_RED), SetDataTip(STR_EMPTY, STR_NULL),
-		NWidget(WWT_PUSHTXTBTN, COLOUR_RED, WID_EM_CLOSE), SetPadding(4, 4, 4, 4), SetDataTip(STR_BUTTON_OK, STR_NULL),
 	EndContainer(),
 };
 
@@ -170,6 +164,16 @@ void ErrorMessageData::SetDParamStr(uint n, const char *str)
 	this->strings[n] = stredup(str);
 }
 
+/**
+ * Set a rawstring parameter.
+ * @param n Parameter index
+ * @param str Raw string
+ */
+void ErrorMessageData::SetDParamStr(uint n, const std::string &str)
+{
+	this->SetDParamStr(n, str.c_str());
+}
+
 /** Define a queue with errors. */
 typedef std::list<ErrorMessageData> ErrorList;
 /** The actual queue with errors. */
@@ -196,14 +200,13 @@ public:
 				CopyInDParam(0, this->decode_params, lengthof(this->decode_params));
 				if (this->textref_stack_size > 0) StartTextRefStackUsage(this->textref_stack_grffile, this->textref_stack_size, this->textref_stack);
 
-				int text_width = std::max(0, (int)size->width - WD_FRAMETEXT_LEFT - WD_FRAMETEXT_RIGHT);
-				this->height_summary = GetStringHeight(this->summary_msg, text_width);
-				this->height_detailed = (this->detailed_msg == INVALID_STRING_ID) ? 0 : GetStringHeight(this->detailed_msg, text_width);
+				this->height_summary = GetStringHeight(this->summary_msg, size->width);
+				this->height_detailed = (this->detailed_msg == INVALID_STRING_ID) ? 0 : GetStringHeight(this->detailed_msg, size->width);
 
 				if (this->textref_stack_size > 0) StopTextRefStackUsage();
 
-				uint panel_height = WD_FRAMERECT_TOP + this->height_summary + WD_FRAMERECT_BOTTOM;
-				if (this->detailed_msg != INVALID_STRING_ID) panel_height += this->height_detailed + WD_PAR_VSEP_WIDE;
+				uint panel_height = this->height_summary;
+				if (this->detailed_msg != INVALID_STRING_ID) panel_height += this->height_detailed + WidgetDimensions::scaled.vsep_wide;
 
 				size->height = std::max(size->height, panel_height);
 				break;
@@ -242,8 +245,8 @@ public:
 			pt.y = UnScaleByZoom(pt.y - vp->virtual_top, vp->zoom) + vp->top;
 			pt.y = (pt.y < (_screen.height >> 1)) ? scr_bot - sm_height : scr_top;
 		} else {
-			pt.x = Clamp(UnScaleByZoom(pt.x - vp->virtual_left, vp->zoom) + vp->left - (sm_width / 2),  0, _screen.width  - sm_width);
-			pt.y = Clamp(UnScaleByZoom(pt.y - vp->virtual_top,  vp->zoom) + vp->top  - (sm_height / 2), scr_top, scr_bot - sm_height);
+			pt.x = std::min(std::max(UnScaleByZoom(pt.x - vp->virtual_left, vp->zoom) + vp->left - (sm_width / 2), 0), _screen.width - sm_width);
+			pt.y = std::min(std::max(UnScaleByZoom(pt.y - vp->virtual_top,  vp->zoom) + vp->top  - (sm_height / 2), scr_top), scr_bot - sm_height);
 		}
 		return pt;
 	}
@@ -256,7 +259,7 @@ public:
 	void OnInvalidateData(int data = 0, bool gui_scope = true) override
 	{
 		/* If company gets shut down, while displaying an error about it, remove the error message. */
-		if (this->face != INVALID_COMPANY && !Company::IsValidID(this->face)) delete this;
+		if (this->face != INVALID_COMPANY && !Company::IsValidID(this->face)) this->Close();
 	}
 
 	void SetStringParameters(int widget) const override
@@ -278,19 +281,14 @@ public:
 				if (this->textref_stack_size > 0) StartTextRefStackUsage(this->textref_stack_grffile, this->textref_stack_size, this->textref_stack);
 
 				if (this->detailed_msg == INVALID_STRING_ID) {
-					DrawStringMultiLine(r.left + WD_FRAMETEXT_LEFT, r.right - WD_FRAMETEXT_RIGHT, r.top + WD_FRAMERECT_TOP, r.bottom - WD_FRAMERECT_BOTTOM,
-							this->summary_msg, TC_FROMSTRING, SA_CENTER);
+					DrawStringMultiLine(r, this->summary_msg, TC_FROMSTRING, SA_CENTER);
 				} else {
-					int extra = (r.bottom - r.top + 1 - this->height_summary - this->height_detailed - WD_PAR_VSEP_WIDE) / 2;
+					/* Extra space when message is shorter than company face window */
+					int extra = (r.Height() - this->height_summary - this->height_detailed - WidgetDimensions::scaled.vsep_wide) / 2;
 
 					/* Note: NewGRF supplied error message often do not start with a colour code, so default to white. */
-					int top = r.top + WD_FRAMERECT_TOP;
-					int bottom = top + this->height_summary + extra;
-					DrawStringMultiLine(r.left + WD_FRAMETEXT_LEFT, r.right - WD_FRAMETEXT_RIGHT, top, bottom, this->summary_msg, TC_WHITE, SA_CENTER);
-
-					bottom = r.bottom - WD_FRAMERECT_BOTTOM;
-					top = bottom - this->height_detailed - extra;
-					DrawStringMultiLine(r.left + WD_FRAMETEXT_LEFT, r.right - WD_FRAMETEXT_RIGHT, top, bottom, this->detailed_msg, TC_WHITE, SA_CENTER);
+					DrawStringMultiLine(r.WithHeight(this->height_summary + extra, false), this->summary_msg, TC_WHITE, SA_CENTER);
+					DrawStringMultiLine(r.WithHeight(this->height_detailed + extra, true), this->detailed_msg, TC_WHITE, SA_CENTER);
 				}
 
 				if (this->textref_stack_size > 0) StopTextRefStackUsage();
@@ -304,32 +302,21 @@ public:
 	void OnMouseLoop() override
 	{
 		/* Disallow closing the window too easily, if timeout is disabled */
-		if (_right_button_down && !this->display_timer.HasElapsed()) delete this;
+		if (_right_button_down && !this->display_timer.HasElapsed()) this->Close();
 	}
 
 	void OnRealtimeTick(uint delta_ms) override
 	{
 		if (this->display_timer.CountElapsed(delta_ms) == 0) return;
 
-		delete this;
+		this->Close();
 	}
 
-	~ErrmsgWindow()
+	void Close() override
 	{
 		SetRedErrorSquare(INVALID_TILE);
 		if (_window_system_initialized) ShowFirstError();
-	}
-
-	void OnClick(Point pt, int widget, int click_count) override
-	{
-		switch (widget) {
-			case WID_EM_CLOSE:
-				delete this;
-				break;
-
-			default:
-				break;
-		}
+		this->Window::Close();
 	}
 
 	/**
@@ -372,7 +359,7 @@ void UnshowCriticalError()
 	if (_window_system_initialized && w != nullptr) {
 		if (w->IsCritical()) _error_list.push_front(*w);
 		_window_system_initialized = false;
-		delete w;
+		w->Close();
 	}
 }
 
@@ -406,10 +393,7 @@ void ShowErrorMessage(StringID summary_msg, StringID detailed_msg, WarningLevel 
 
 		if (textref_stack_size > 0) StopTextRefStackUsage();
 
-		switch (wl) {
-			case WL_WARNING: IConsolePrint(CC_WARNING, buf); break;
-			default:         IConsoleError(buf); break;
-		}
+		IConsolePrint(wl == WL_WARNING ? CC_WARNING : CC_ERROR, buf);
 	}
 
 	bool no_timeout = wl == WL_CRITICAL;
@@ -421,18 +405,20 @@ void ShowErrorMessage(StringID summary_msg, StringID detailed_msg, WarningLevel 
 	data.CopyOutDParams();
 
 	ErrmsgWindow *w = (ErrmsgWindow*)FindWindowById(WC_ERRMSG, 0);
-	if (w != nullptr && w->IsCritical()) {
-		/* A critical error is currently shown. */
-		if (wl == WL_CRITICAL) {
-			/* Push another critical error in the queue of errors,
-			 * but do not put other errors in the queue. */
-			_error_list.push_back(data);
+	if (w != nullptr) {
+		if (w->IsCritical()) {
+			/* A critical error is currently shown. */
+			if (wl == WL_CRITICAL) {
+				/* Push another critical error in the queue of errors,
+				 * but do not put other errors in the queue. */
+				_error_list.push_back(data);
+			}
+			return;
 		}
-	} else {
-		/* Nothing or a non-critical error was shown. */
-		delete w;
-		new ErrmsgWindow(data);
+		/* A non-critical error was shown. */
+		w->Close();
 	}
+	new ErrmsgWindow(data);
 }
 
 
@@ -443,7 +429,7 @@ void ShowErrorMessage(StringID summary_msg, StringID detailed_msg, WarningLevel 
 bool HideActiveErrorMessage() {
 	ErrmsgWindow *w = (ErrmsgWindow*)FindWindowById(WC_ERRMSG, 0);
 	if (w == nullptr) return false;
-	delete w;
+	w->Close();
 	return true;
 }
 

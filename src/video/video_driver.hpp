@@ -167,15 +167,18 @@ public:
 	}
 
 	/**
-	 * Get a suggested default GUI zoom taking screen DPI into account.
+	 * Get a suggested default GUI scale taking screen DPI into account.
 	 */
-	virtual ZoomLevel GetSuggestedUIZoom()
+	virtual int GetSuggestedUIScale()
 	{
 		float dpi_scale = this->GetDPIScale();
 
-		if (dpi_scale >= 3.0f) return ZOOM_LVL_NORMAL;
-		if (dpi_scale >= 1.5f) return ZOOM_LVL_OUT_2X;
-		return ZOOM_LVL_OUT_4X;
+		return Clamp(dpi_scale * 100, MIN_INTERFACE_SCALE, MAX_INTERFACE_SCALE);
+	}
+
+	virtual const char *GetInfoString() const
+	{
+		return this->GetName();
 	}
 
 	/**
@@ -192,6 +195,14 @@ public:
 	}
 
 	void GameLoopPause();
+
+	/**
+	 * Set clipboard contents, the video thread will call the OS clipboard API
+	 */
+	void SetClipboardContents(const std::string &text)
+	{
+		this->set_clipboard_text = text;
+	}
 
 	/**
 	 * Get the currently active instance of the video driver.
@@ -316,25 +327,10 @@ protected:
 
 	std::chrono::steady_clock::duration GetDrawInterval()
 	{
+		/* If vsync, draw interval is decided by the display driver */
+		if (_video_vsync && _video_hw_accel) return std::chrono::microseconds(0);
 		return std::chrono::microseconds(1000000 / _settings_client.gui.refresh_rate);
 	}
-
-	std::chrono::steady_clock::time_point next_game_tick;
-	std::chrono::steady_clock::time_point next_draw_tick;
-
-	bool fast_forward_key_pressed; ///< The fast-forward key is being pressed.
-	bool fast_forward_via_key; ///< The fast-forward was enabled by key press.
-
-	bool is_game_threaded;
-	std::thread game_thread;
-	std::mutex game_state_mutex;
-	std::mutex game_thread_wait_mutex;
-
-	static void GameThreadThunk(VideoDriver *drv);
-
-private:
-	std::mutex cmd_queue_mutex;
-	std::vector<std::function<void()>> cmd_queue;
 
 	/** Execute all queued commands. */
 	void DrainCommandQueue()
@@ -353,6 +349,24 @@ private:
 			f();
 		}
 	}
+
+	std::chrono::steady_clock::time_point next_game_tick;
+	std::chrono::steady_clock::time_point next_draw_tick;
+
+	bool fast_forward_key_pressed; ///< The fast-forward key is being pressed.
+	bool fast_forward_via_key; ///< The fast-forward was enabled by key press.
+	std::string set_clipboard_text; ///< New clipboard contents to set
+
+	bool is_game_threaded;
+	std::thread game_thread;
+	std::mutex game_state_mutex;
+	std::mutex game_thread_wait_mutex;
+
+	static void GameThreadThunk(VideoDriver *drv);
+
+private:
+	std::mutex cmd_queue_mutex;
+	std::vector<std::function<void()>> cmd_queue;
 
 	void GameLoop();
 	void GameThread();

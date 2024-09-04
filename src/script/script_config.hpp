@@ -16,6 +16,7 @@
 #include "../core/string_compare_type.hpp"
 #include "../company_type.h"
 #include "../textfile_gui.h"
+#include "script_instance.hpp"
 
 /** Bitmask of flags for Script settings. */
 enum ScriptConfigFlags {
@@ -63,7 +64,8 @@ public:
 		version(-1),
 		info(nullptr),
 		config_list(nullptr),
-		is_random(false)
+		is_random(false),
+		to_load_data(nullptr)
 	{}
 
 	/**
@@ -116,7 +118,7 @@ public:
 	void AnchorUnchangeableSettings();
 
 	/**
-	 * Get the value of a setting for this config. It might fallback to his
+	 * Get the value of a setting for this config. It might fallback to its
 	 *  'info' to find the default value (if not set or if not-custom difficulty
 	 *  level).
 	 * @return The (default) value of the setting, or -1 if the setting was not
@@ -169,13 +171,13 @@ public:
 	 * Convert a string which is stored in the config file or savegames to
 	 *  custom settings of this Script.
 	 */
-	void StringToSettings(const char *value);
+	void StringToSettings(const std::string &value);
 
 	/**
 	 * Convert the custom settings to a string that can be stored in the config
 	 *  file or savegames.
 	 */
-	void SettingsToString(char *string, const char *last) const;
+	std::string SettingsToString() const;
 
 	/**
 	 * Search a textfile file next to this script.
@@ -185,13 +187,17 @@ public:
 	 */
 	const char *GetTextfile(TextfileType type, CompanyID slot) const;
 
+	void SetToLoadData(ScriptInstance::ScriptData *data);
+	ScriptInstance::ScriptData *GetToLoadData();
+
 protected:
-	const char *name;                  ///< Name of the Script
-	int version;                       ///< Version of the Script
-	class ScriptInfo *info;            ///< ScriptInfo object for related to this Script version
-	SettingValueList settings;         ///< List with all setting=>value pairs that are configure for this Script
-	ScriptConfigItemList *config_list; ///< List with all settings defined by this Script
-	bool is_random;                    ///< True if the AI in this slot was randomly chosen.
+	const char *name;                                         ///< Name of the Script
+	int version;                                              ///< Version of the Script
+	class ScriptInfo *info;                                   ///< ScriptInfo object for related to this Script version
+	SettingValueList settings;                                ///< List with all setting=>value pairs that are configure for this Script
+	ScriptConfigItemList *config_list;                        ///< List with all settings defined by this Script
+	bool is_random;                                           ///< True if the AI in this slot was randomly chosen.
+	std::unique_ptr<ScriptInstance::ScriptData> to_load_data; ///< Data to load after the Script start.
 
 	/**
 	 * In case you have mandatory non-Script-definable config entries in your

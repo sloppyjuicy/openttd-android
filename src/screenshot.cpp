@@ -12,6 +12,7 @@
 #include "viewport_func.h"
 #include "gfx_func.h"
 #include "screenshot.h"
+#include "screenshot_gui.h"
 #include "blitter/factory.hpp"
 #include "zoom_func.h"
 #include "core/endian_func.hpp"
@@ -25,8 +26,8 @@
 #include "window_func.h"
 #include "tile_map.h"
 #include "landscape.h"
-#include "blitter/16bpp_base.hpp"
 #include "video/video_driver.hpp"
+#include "smallmap_gui.h"
 
 #include "table/strings.h"
 
@@ -35,7 +36,7 @@
 static const char * const SCREENSHOT_NAME = "screenshot"; ///< Default filename of a saved screenshot.
 static const char * const HEIGHTMAP_NAME  = "heightmap";  ///< Default filename of a saved heightmap.
 
-char _screenshot_format_name[8];      ///< Extension of the current screenshot format (corresponds with #_cur_screenshot_format).
+std::string _screenshot_format_name;  ///< Extension of the current screenshot format (corresponds with #_cur_screenshot_format).
 uint _num_screenshot_formats;         ///< Number of available screenshot formats.
 uint _cur_screenshot_format;          ///< Index of the currently selected screenshot format in #_screenshot_formats.
 static char _screenshot_name[256];    ///< Filename of the screenshot file.
@@ -238,13 +239,13 @@ static bool MakeBMPImage(const char *name, ScreenshotCallback *callb, void *user
 
 static void PNGAPI png_my_error(png_structp png_ptr, png_const_charp message)
 {
-	DEBUG(misc, 0, "[libpng] error: %s - %s", message, (const char *)png_get_error_ptr(png_ptr));
+	Debug(misc, 0, "[libpng] error: {} - {}", message, (const char *)png_get_error_ptr(png_ptr));
 	longjmp(png_jmpbuf(png_ptr), 1);
 }
 
 static void PNGAPI png_my_warning(png_structp png_ptr, png_const_charp message)
 {
-	DEBUG(misc, 1, "[libpng] warning: %s - %s", message, (const char *)png_get_error_ptr(png_ptr));
+	Debug(misc, 1, "[libpng] warning: {} - {}", message, (const char *)png_get_error_ptr(png_ptr));
 }
 
 /**
@@ -384,17 +385,6 @@ static bool MakePNGImage(const char *name, ScreenshotCallback *callb, void *user
 		/* render the pixels into the buffer */
 		callb(userdata, buff, y, w, n);
 		y += n;
-		if (pixelformat == 16) {
-			// Convert to 24bpp
-			Blitter_16bppBase::Colour16 *inp = (Blitter_16bppBase::Colour16 *)buff;
-			uint8 *outp = (uint8 *)buff;
-			for (i = 1; i <= w * n; i++) {
-				outp[(w * n - i) * 3    ] = inp[w * n - i].r << 3;
-				outp[(w * n - i) * 3 + 1] = inp[w * n - i].g << 2;
-				outp[(w * n - i) * 3 + 2] = inp[w * n - i].b << 3;
-				//outp[(w * n - i) * 3] = 0xff;
-			}
-		}
 
 		/* write them to png */
 		for (i = 0; i != n; i++) {
@@ -457,7 +447,7 @@ static bool MakePCXImage(const char *name, ScreenshotCallback *callb, void *user
 	bool success;
 
 	if (pixelformat == 32) {
-		DEBUG(misc, 0, "Can't convert a 32bpp screenshot to PCX format. Please pick another format.");
+		Debug(misc, 0, "Can't convert a 32bpp screenshot to PCX format. Please pick another format.");
 		return false;
 	}
 	if (pixelformat != 8 || w == 0) return false;
@@ -597,7 +587,7 @@ void InitializeScreenshotFormats()
 {
 	uint j = 0;
 	for (uint i = 0; i < lengthof(_screenshot_formats); i++) {
-		if (!strcmp(_screenshot_format_name, _screenshot_formats[i].extension)) {
+		if (_screenshot_format_name.compare(_screenshot_formats[i].extension) == 0) {
 			j = i;
 			break;
 		}
@@ -692,8 +682,16 @@ static const char *MakeScreenshotName(const char *default_fn, const char *ext, b
 		}
 	}
 
-	/* Add extension to screenshot file */
 	size_t len = strlen(_screenshot_name);
+
+	/* Handle user-specified filenames ending in # with automatic numbering */
+	if (StrEndsWith(_screenshot_name, "#")) {
+		generate = true;
+		len -= 1;
+		_screenshot_name[len] = '\0';
+	}
+
+	/* Add extension to screenshot file */
 	seprintf(&_screenshot_name[len], lastof(_screenshot_name), ".%s", ext);
 
 	const char *screenshot_dir = crashlog ? _personal_dir.c_str() : FiosGetScreenshotDir();
@@ -922,8 +920,10 @@ static bool RealMakeScreenshot(ScreenshotType t, std::string name, uint32 width,
 		 * of the screenshot. This way the screenshot will always show the name
 		 * of the previous screenshot in the 'successful' message instead of the
 		 * name of the new screenshot (or an empty name). */
+		SetScreenshotWindowVisibility(true);
 		UndrawMouseCursor();
 		DrawDirtyBlocks();
+		SetScreenshotWindowVisibility(false);
 	}
 
 	_screenshot_name[0] = '\0';
@@ -1005,48 +1005,8 @@ bool MakeScreenshot(ScreenshotType t, std::string name, uint32 width, uint32 hei
 }
 
 
-/**
- * Return the owner of a tile to display it with in the small map in mode "Owner".
- *
- * @param tile The tile of which we would like to get the colour.
- * @return The owner of tile in the small map in mode "Owner"
- */
-static Owner GetMinimapOwner(TileIndex tile)
-{
-	Owner o;
-
-	if (IsTileType(tile, MP_VOID)) {
-		return OWNER_END;
-	} else {
-		switch (GetTileType(tile)) {
-		case MP_INDUSTRY: o = OWNER_DEITY;        break;
-		case MP_HOUSE:    o = OWNER_TOWN;         break;
-		default:          o = GetTileOwner(tile); break;
-			/* FIXME: For MP_ROAD there are multiple owners.
-			 * GetTileOwner returns the rail owner (level crossing) resp. the owner of ROADTYPE_ROAD (normal road),
-			 * even if there are no ROADTYPE_ROAD bits on the tile.
-			 */
-		}
-
-		return o;
-	}
-}
-
 static void MinimapScreenCallback(void *userdata, void *buf, uint y, uint pitch, uint n)
 {
-	/* Fill with the company colours */
-	byte owner_colours[OWNER_END + 1];
-	for (const Company *c : Company::Iterate()) {
-		owner_colours[c->index] = MKCOLOUR(_colour_gradient[c->colour][5]);
-	}
-
-	/* Fill with some special colours */
-	owner_colours[OWNER_TOWN]    = PC_DARK_RED;
-	owner_colours[OWNER_NONE]    = PC_GRASS_LAND;
-	owner_colours[OWNER_WATER]   = PC_WATER;
-	owner_colours[OWNER_DEITY]   = PC_DARK_GREY; // industry
-	owner_colours[OWNER_END]     = PC_BLACK;
-
 	uint32 *ubuf = (uint32 *)buf;
 	uint num = (pitch * n);
 	for (uint i = 0; i < num; i++) {
@@ -1054,8 +1014,7 @@ static void MinimapScreenCallback(void *userdata, void *buf, uint y, uint pitch,
 		uint col = (MapSizeX() - 1) - (i % pitch);
 
 		TileIndex tile = TileXY(col, row);
-		Owner o = GetMinimapOwner(tile);
-		byte val = owner_colours[o];
+		byte val = GetSmallMapOwnerPixels(tile, GetTileType(tile), IncludeHeightmap::Never) & 0xFF;
 
 		uint32 colour_buf = 0;
 		colour_buf  = (_cur_palette.palette[val].b << 0);

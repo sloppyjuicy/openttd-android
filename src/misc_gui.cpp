@@ -27,11 +27,15 @@
 #include "guitimer_func.h"
 #include "build_confirmation_func.h"
 #include "viewport_func.h"
+#include "landscape_cmd.h"
 #include "rev.h"
 
 #include "widgets/misc_widget.h"
 
 #include "table/strings.h"
+
+#include <sstream>
+#include <iomanip>
 
 #include "safeguards.h"
 
@@ -72,34 +76,25 @@ static WindowDesc _land_info_desc(
 );
 
 class LandInfoWindow : public Window {
-	enum LandInfoLines {
-		LAND_INFO_CENTERED_LINES   = 32,                       ///< Up to 32 centered lines (arbitrary limit)
-		LAND_INFO_MULTICENTER_LINE = LAND_INFO_CENTERED_LINES, ///< One multicenter line
-		LAND_INFO_LINE_END,
-	};
-
-	static const uint LAND_INFO_LINE_BUFF_SIZE = 512;
+	StringList  landinfo_data;    ///< Info lines to show.
+	std::string cargo_acceptance; ///< Centered multi-line string for cargo acceptance.
 
 public:
-	char landinfo_data[LAND_INFO_LINE_END][LAND_INFO_LINE_BUFF_SIZE];
 	TileIndex tile;
 
 	void DrawWidget(const Rect &r, int widget) const override
 	{
 		if (widget != WID_LI_BACKGROUND) return;
 
-		uint y = r.top + WD_TEXTPANEL_TOP;
-		for (uint i = 0; i < LAND_INFO_CENTERED_LINES; i++) {
-			if (StrEmpty(this->landinfo_data[i])) break;
-
-			DrawString(r.left + WD_FRAMETEXT_LEFT, r.right - WD_FRAMETEXT_RIGHT, y, this->landinfo_data[i], i == 0 ? TC_LIGHT_BLUE : TC_FROMSTRING, SA_HOR_CENTER);
-			y += FONT_HEIGHT_NORMAL + WD_PAR_VSEP_NORMAL;
-			if (i == 0) y += 4;
+		Rect ir = r.Shrink(WidgetDimensions::scaled.frametext);
+		for (size_t i = 0; i < this->landinfo_data.size(); i++) {
+			DrawString(ir, this->landinfo_data[i], i == 0 ? TC_LIGHT_BLUE : TC_FROMSTRING, SA_HOR_CENTER);
+			ir.top += FONT_HEIGHT_NORMAL + (i == 0 ? WidgetDimensions::scaled.vsep_wide : WidgetDimensions::scaled.vsep_normal);
 		}
 
-		if (!StrEmpty(this->landinfo_data[LAND_INFO_MULTICENTER_LINE])) {
-			SetDParamStr(0, this->landinfo_data[LAND_INFO_MULTICENTER_LINE]);
-			DrawStringMultiLine(r.left + WD_FRAMETEXT_LEFT, r.right - WD_FRAMETEXT_RIGHT, y, r.bottom - WD_TEXTPANEL_BOTTOM, STR_JUST_RAW_STRING, TC_FROMSTRING, SA_CENTER);
+		if (!this->cargo_acceptance.empty()) {
+			SetDParamStr(0, this->cargo_acceptance);
+			DrawStringMultiLine(ir, STR_JUST_RAW_STRING, TC_FROMSTRING, SA_CENTER);
 		}
 	}
 
@@ -107,22 +102,19 @@ public:
 	{
 		if (widget != WID_LI_BACKGROUND) return;
 
-		size->height = WD_TEXTPANEL_TOP + WD_TEXTPANEL_BOTTOM;
-		for (uint i = 0; i < LAND_INFO_CENTERED_LINES; i++) {
-			if (StrEmpty(this->landinfo_data[i])) break;
-
-			uint width = GetStringBoundingBox(this->landinfo_data[i]).width + WD_FRAMETEXT_LEFT + WD_FRAMETEXT_RIGHT;
+		size->height = WidgetDimensions::scaled.frametext.Vertical();
+		for (size_t i = 0; i < this->landinfo_data.size(); i++) {
+			uint width = GetStringBoundingBox(this->landinfo_data[i]).width + WidgetDimensions::scaled.frametext.Horizontal();
 			size->width = std::max(size->width, width);
 
-			size->height += FONT_HEIGHT_NORMAL + WD_PAR_VSEP_NORMAL;
-			if (i == 0) size->height += 4;
+			size->height += FONT_HEIGHT_NORMAL + (i == 0 ? WidgetDimensions::scaled.vsep_wide : WidgetDimensions::scaled.vsep_normal);
 		}
 
-		if (!StrEmpty(this->landinfo_data[LAND_INFO_MULTICENTER_LINE])) {
-			uint width = GetStringBoundingBox(this->landinfo_data[LAND_INFO_MULTICENTER_LINE]).width + WD_FRAMETEXT_LEFT + WD_FRAMETEXT_RIGHT;
+		if (!this->cargo_acceptance.empty()) {
+			uint width = GetStringBoundingBox(this->cargo_acceptance).width + WidgetDimensions::scaled.frametext.Horizontal();
 			size->width = std::max(size->width, std::min(300u, width));
-			SetDParamStr(0, this->landinfo_data[LAND_INFO_MULTICENTER_LINE]);
-			size->height += GetStringHeight(STR_JUST_RAW_STRING, size->width - WD_FRAMETEXT_LEFT - WD_FRAMETEXT_RIGHT);
+			SetDParamStr(0, cargo_acceptance);
+			size->height += GetStringHeight(STR_JUST_RAW_STRING, size->width - WidgetDimensions::scaled.frametext.Horizontal());
 		}
 	}
 
@@ -135,17 +127,17 @@ public:
 #else
 #	define LANDINFOD_LEVEL 1
 #endif
-		DEBUG(misc, LANDINFOD_LEVEL, "TILE: %#x (%i,%i)", tile, TileX(tile), TileY(tile));
-		DEBUG(misc, LANDINFOD_LEVEL, "type   = %#x", _m[tile].type);
-		DEBUG(misc, LANDINFOD_LEVEL, "height = %#x", _m[tile].height);
-		DEBUG(misc, LANDINFOD_LEVEL, "m1     = %#x", _m[tile].m1);
-		DEBUG(misc, LANDINFOD_LEVEL, "m2     = %#x", _m[tile].m2);
-		DEBUG(misc, LANDINFOD_LEVEL, "m3     = %#x", _m[tile].m3);
-		DEBUG(misc, LANDINFOD_LEVEL, "m4     = %#x", _m[tile].m4);
-		DEBUG(misc, LANDINFOD_LEVEL, "m5     = %#x", _m[tile].m5);
-		DEBUG(misc, LANDINFOD_LEVEL, "m6     = %#x", _me[tile].m6);
-		DEBUG(misc, LANDINFOD_LEVEL, "m7     = %#x", _me[tile].m7);
-		DEBUG(misc, LANDINFOD_LEVEL, "m8     = %#x", _me[tile].m8);
+		Debug(misc, LANDINFOD_LEVEL, "TILE: {:#x} ({},{})", tile, TileX(tile), TileY(tile));
+		Debug(misc, LANDINFOD_LEVEL, "type   = {:#x}", _m[tile].type);
+		Debug(misc, LANDINFOD_LEVEL, "height = {:#x}", _m[tile].height);
+		Debug(misc, LANDINFOD_LEVEL, "m1     = {:#x}", _m[tile].m1);
+		Debug(misc, LANDINFOD_LEVEL, "m2     = {:#x}", _m[tile].m2);
+		Debug(misc, LANDINFOD_LEVEL, "m3     = {:#x}", _m[tile].m3);
+		Debug(misc, LANDINFOD_LEVEL, "m4     = {:#x}", _m[tile].m4);
+		Debug(misc, LANDINFOD_LEVEL, "m5     = {:#x}", _m[tile].m5);
+		Debug(misc, LANDINFOD_LEVEL, "m6     = {:#x}", _me[tile].m6);
+		Debug(misc, LANDINFOD_LEVEL, "m7     = {:#x}", _me[tile].m7);
+		Debug(misc, LANDINFOD_LEVEL, "m8     = {:#x}", _me[tile].m8);
 #undef LANDINFOD_LEVEL
 	}
 
@@ -189,12 +181,11 @@ public:
 		AddAcceptedCargo(tile, acceptance, nullptr);
 		GetTileDesc(tile, &td);
 
-		uint line_nr = 0;
+		this->landinfo_data.clear();
 
 		/* Tiletype */
 		SetDParam(0, td.dparam[0]);
-		GetString(this->landinfo_data[line_nr], td.str, lastof(this->landinfo_data[line_nr]));
-		line_nr++;
+		this->landinfo_data.push_back(GetString(td.str));
 
 		/* Up to four owners */
 		for (uint i = 0; i < 4; i++) {
@@ -202,8 +193,7 @@ public:
 
 			SetDParam(0, STR_LAND_AREA_INFORMATION_OWNER_N_A);
 			if (td.owner[i] != OWNER_NONE && td.owner[i] != OWNER_WATER) GetNameOfOwner(td.owner[i], tile);
-			GetString(this->landinfo_data[line_nr], td.owner_type[i], lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(td.owner_type[i]));
 		}
 
 		/* Cost to clear/revenue when cleared */
@@ -211,7 +201,7 @@ public:
 		Company *c = Company::GetIfValid(_local_company);
 		if (c != nullptr) {
 			assert(_current_company == _local_company);
-			CommandCost costclear = DoCommand(tile, 0, 0, DC_QUERY_COST, CMD_LANDSCAPE_CLEAR);
+			CommandCost costclear = Command<CMD_LANDSCAPE_CLEAR>::Do(DC_QUERY_COST, tile);
 			if (costclear.Succeeded()) {
 				Money cost = costclear.GetCost();
 				if (cost < 0) {
@@ -223,18 +213,18 @@ public:
 				SetDParam(0, cost);
 			}
 		}
-		GetString(this->landinfo_data[line_nr], str, lastof(this->landinfo_data[line_nr]));
-		line_nr++;
+		this->landinfo_data.push_back(GetString(str));
 
 		/* Location */
-		char tmp[16];
-		seprintf(tmp, lastof(tmp), "0x%.4X", tile);
+		std::stringstream tile_ss;
+		tile_ss << "0x" << std::setfill('0') << std::setw(4) << std::hex << std::uppercase << tile; // 0x%.4X
+		std::string tile_str = tile_ss.str(); // Can't pass it directly to SetDParamStr as the string is only a temporary and would be destructed before the GetString call.
+
 		SetDParam(0, TileX(tile));
 		SetDParam(1, TileY(tile));
 		SetDParam(2, GetTileZ(tile));
-		SetDParamStr(3, tmp);
-		GetString(this->landinfo_data[line_nr], STR_LAND_AREA_INFORMATION_LANDINFO_COORDS, lastof(this->landinfo_data[line_nr]));
-		line_nr++;
+		SetDParamStr(3, tile_str);
+		this->landinfo_data.push_back(GetString(STR_LAND_AREA_INFORMATION_LANDINFO_COORDS));
 
 		/* Local authority */
 		SetDParam(0, STR_LAND_AREA_INFORMATION_LOCAL_AUTHORITY_NONE);
@@ -242,126 +232,112 @@ public:
 			SetDParam(0, STR_TOWN_NAME);
 			SetDParam(1, t->index);
 		}
-		GetString(this->landinfo_data[line_nr], STR_LAND_AREA_INFORMATION_LOCAL_AUTHORITY, lastof(this->landinfo_data[line_nr]));
-		line_nr++;
+		this->landinfo_data.push_back(GetString(STR_LAND_AREA_INFORMATION_LOCAL_AUTHORITY));
 
 		/* Build date */
 		if (td.build_date != INVALID_DATE) {
 			SetDParam(0, td.build_date);
-			GetString(this->landinfo_data[line_nr], STR_LAND_AREA_INFORMATION_BUILD_DATE, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LAND_AREA_INFORMATION_BUILD_DATE));
 		}
 
 		/* Station class */
 		if (td.station_class != STR_NULL) {
 			SetDParam(0, td.station_class);
-			GetString(this->landinfo_data[line_nr], STR_LAND_AREA_INFORMATION_STATION_CLASS, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LAND_AREA_INFORMATION_STATION_CLASS));
 		}
 
 		/* Station type name */
 		if (td.station_name != STR_NULL) {
 			SetDParam(0, td.station_name);
-			GetString(this->landinfo_data[line_nr], STR_LAND_AREA_INFORMATION_STATION_TYPE, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LAND_AREA_INFORMATION_STATION_TYPE));
 		}
 
 		/* Airport class */
 		if (td.airport_class != STR_NULL) {
 			SetDParam(0, td.airport_class);
-			GetString(this->landinfo_data[line_nr], STR_LAND_AREA_INFORMATION_AIRPORT_CLASS, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LAND_AREA_INFORMATION_AIRPORT_CLASS));
 		}
 
 		/* Airport name */
 		if (td.airport_name != STR_NULL) {
 			SetDParam(0, td.airport_name);
-			GetString(this->landinfo_data[line_nr], STR_LAND_AREA_INFORMATION_AIRPORT_NAME, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LAND_AREA_INFORMATION_AIRPORT_NAME));
 		}
 
 		/* Airport tile name */
 		if (td.airport_tile_name != STR_NULL) {
 			SetDParam(0, td.airport_tile_name);
-			GetString(this->landinfo_data[line_nr], STR_LAND_AREA_INFORMATION_AIRPORTTILE_NAME, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LAND_AREA_INFORMATION_AIRPORTTILE_NAME));
 		}
 
 		/* Rail type name */
 		if (td.railtype != STR_NULL) {
 			SetDParam(0, td.railtype);
-			GetString(this->landinfo_data[line_nr], STR_LANG_AREA_INFORMATION_RAIL_TYPE, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LANG_AREA_INFORMATION_RAIL_TYPE));
 		}
 
 		/* Rail speed limit */
 		if (td.rail_speed != 0) {
 			SetDParam(0, td.rail_speed);
-			GetString(this->landinfo_data[line_nr], STR_LANG_AREA_INFORMATION_RAIL_SPEED_LIMIT, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LANG_AREA_INFORMATION_RAIL_SPEED_LIMIT));
 		}
 
 		/* Road type name */
 		if (td.roadtype != STR_NULL) {
 			SetDParam(0, td.roadtype);
-			GetString(this->landinfo_data[line_nr], STR_LANG_AREA_INFORMATION_ROAD_TYPE, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LANG_AREA_INFORMATION_ROAD_TYPE));
 		}
 
 		/* Road speed limit */
 		if (td.road_speed != 0) {
 			SetDParam(0, td.road_speed);
-			GetString(this->landinfo_data[line_nr], STR_LANG_AREA_INFORMATION_ROAD_SPEED_LIMIT, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LANG_AREA_INFORMATION_ROAD_SPEED_LIMIT));
 		}
 
 		/* Tram type name */
 		if (td.tramtype != STR_NULL) {
 			SetDParam(0, td.tramtype);
-			GetString(this->landinfo_data[line_nr], STR_LANG_AREA_INFORMATION_TRAM_TYPE, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LANG_AREA_INFORMATION_TRAM_TYPE));
 		}
 
 		/* Tram speed limit */
 		if (td.tram_speed != 0) {
 			SetDParam(0, td.tram_speed);
-			GetString(this->landinfo_data[line_nr], STR_LANG_AREA_INFORMATION_TRAM_SPEED_LIMIT, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LANG_AREA_INFORMATION_TRAM_SPEED_LIMIT));
 		}
 
 		/* NewGRF name */
 		if (td.grf != nullptr) {
 			SetDParamStr(0, td.grf);
-			GetString(this->landinfo_data[line_nr], STR_LAND_AREA_INFORMATION_NEWGRF_NAME, lastof(this->landinfo_data[line_nr]));
-			line_nr++;
+			this->landinfo_data.push_back(GetString(STR_LAND_AREA_INFORMATION_NEWGRF_NAME));
 		}
 
-		assert(line_nr < LAND_INFO_CENTERED_LINES);
-
-		/* Mark last line empty */
-		this->landinfo_data[line_nr][0] = '\0';
-
 		/* Cargo acceptance is displayed in a extra multiline */
-		char *strp = GetString(this->landinfo_data[LAND_INFO_MULTICENTER_LINE], STR_LAND_AREA_INFORMATION_CARGO_ACCEPTED, lastof(this->landinfo_data[LAND_INFO_MULTICENTER_LINE]));
-		bool found = false;
+		std::stringstream line;
+		line << GetString(STR_LAND_AREA_INFORMATION_CARGO_ACCEPTED);
 
+		bool found = false;
 		for (CargoID i = 0; i < NUM_CARGO; ++i) {
 			if (acceptance[i] > 0) {
 				/* Add a comma between each item. */
-				if (found) strp = strecpy(strp, ", ", lastof(this->landinfo_data[LAND_INFO_MULTICENTER_LINE]));
+				if (found) line << ", ";
 				found = true;
 
 				/* If the accepted value is less than 8, show it in 1/8:ths */
 				if (acceptance[i] < 8) {
 					SetDParam(0, acceptance[i]);
 					SetDParam(1, CargoSpec::Get(i)->name);
-					strp = GetString(strp, STR_LAND_AREA_INFORMATION_CARGO_EIGHTS, lastof(this->landinfo_data[LAND_INFO_MULTICENTER_LINE]));
+					line << GetString(STR_LAND_AREA_INFORMATION_CARGO_EIGHTS);
 				} else {
-					strp = GetString(strp, CargoSpec::Get(i)->name, lastof(this->landinfo_data[LAND_INFO_MULTICENTER_LINE]));
+					line << GetString(CargoSpec::Get(i)->name);
 				}
 			}
 		}
-		if (!found) this->landinfo_data[LAND_INFO_MULTICENTER_LINE][0] = '\0';
+		if (found) {
+			this->cargo_acceptance = line.str();
+		} else {
+			this->cargo_acceptance.clear();
+		}
 	}
 
 	bool IsNewGRFInspectable() const override
@@ -410,7 +386,7 @@ public:
  */
 void ShowLandInfo(TileIndex tile)
 {
-	DeleteWindowById(WC_LAND_INFO, 0);
+	CloseWindowById(WC_LAND_INFO, 0);
 	new LandInfoWindow(tile);
 }
 
@@ -442,10 +418,7 @@ static const char * const _credits[] = {
 	u8"Original graphics by Simon Foster",
 	u8"",
 	u8"The OpenTTD team (in alphabetical order):",
-	u8"  Grzegorz Duczy\u0144ski (adf88) - General coding (since 1.7.2)",
-	u8"  Albert Hofkamp (Alberth) - GUI expert (since 0.7)",
 	u8"  Matthijs Kooijman (blathijs) - Pathfinder-guru, Debian port (since 0.3)",
-	u8"  Ulf Hermann (fonsinchen) - Cargo Distribution (since 1.3)",
 	u8"  Christoph Elsenhans (frosch) - General coding (since 0.6)",
 	u8"  Lo\u00efc Guilloux (glx) - General / Windows Expert (since 0.4.5)",
 	u8"  Charles Pigott (LordAro) - General / Correctness police (since 1.9)",
@@ -453,20 +426,24 @@ static const char * const _credits[] = {
 	u8"  Niels Martin Hansen (nielsm) - Music system, general coding (since 1.9)",
 	u8"  Owen Rudge (orudge) - Forum host, OS/2 port (since 0.1)",
 	u8"  Peter Nelson (peter1138) - Spiritual descendant from NewGRF gods (since 0.4.5)",
-	u8"  Ingo von Borstel (planetmaker) - General, Support (since 1.1)",
-	u8"  Remko Bijker (Rubidium) - Lead coder and way more (since 0.4.5)",
-	u8"  Jos\u00e9 Soler (Terkhen) - General coding (since 1.0)",
+	u8"  Remko Bijker (Rubidium) - Coder and way more (since 0.4.5)",
+	u8"  Patric Stout (TrueBrain) - NoProgrammer (since 0.3), sys op",
+	u8"  Tyler Trahan (2TallTyler) - General coding (since 13)",
 	u8"",
 	u8"Inactive Developers:",
+	u8"  Grzegorz Duczy\u0144ski (adf88) - General coding (1.7 - 1.8)",
+	u8"  Albert Hofkamp (Alberth) - GUI expert (0.7 - 1.9)",
 	u8"  Jean-Fran\u00e7ois Claeys (Belugas) - GUI, NewGRF and more (0.4.5 - 1.0)",
 	u8"  Bjarni Corfitzen (Bjarni) - MacOSX port, coder and vehicles (0.3 - 0.7)",
 	u8"  Victor Fischer (Celestar) - Programming everywhere you need him to (0.3 - 0.6)",
+	u8"  Ulf Hermann (fonsinchen) - Cargo Distribution (1.3 - 1.6)",
 	u8"  Jaroslav Mazanec (KUDr) - YAPG (Yet Another Pathfinder God) ;) (0.4.5 - 0.6)",
 	u8"  Jonathan Coome (Maedhros) - High priest of the NewGRF Temple (0.5 - 0.6)",
 	u8"  Attila B\u00e1n (MiHaMiX) - Developer WebTranslator 1 and 2 (0.3 - 0.5)",
+	u8"  Ingo von Borstel (planetmaker) - General coding, Support (1.1 - 1.9)",
 	u8"  Zden\u011bk Sojka (SmatZ) - Bug finder and fixer (0.6 - 1.3)",
+	u8"  Jos\u00e9 Soler (Terkhen) - General coding (1.0 - 1.4)",
 	u8"  Christoph Mallon (Tron) - Programmer, code correctness police (0.3 - 0.5)",
-	u8"  Patric Stout (TrueBrain) - NoAI, NoGo, Network (0.3 - 1.2), sys op (active)",
 	u8"  Thijs Marinussen (Yexo) - AI Framework, General (0.6 - 1.3)",
 	u8"  Leif Linse (Zuu) - AI/Game Script (1.2 - 1.6)",
 	u8"",
@@ -488,7 +465,7 @@ static const char * const _credits[] = {
 	u8"  Mike Ragsdale - OpenTTD installer",
 	u8"  Christian Rosentreter (tokai) - MorphOS / AmigaOS port",
 	u8"  Richard Kempton (richK) - additional airports, initial TGP implementation",
-	u8"",
+	u8"  Plus C - title game",
 	u8"  Alberto Demichelis - Squirrel scripting language \u00a9 2003-2008",
 	u8"  L. Peter Deutsch - MD5 implementation \u00a9 1999, 2000, 2002",
 	u8"  Michael Blunck - Pre-signals and semaphores \u00a9 2003",
@@ -568,14 +545,14 @@ struct AboutWindow : public Window {
 			if (this->text_position < (int)(this->GetWidget<NWidgetBase>(WID_A_SCROLLING_TEXT)->pos_y - lengthof(_credits) * this->line_height)) {
 				this->text_position = this->GetWidget<NWidgetBase>(WID_A_SCROLLING_TEXT)->pos_y + this->GetWidget<NWidgetBase>(WID_A_SCROLLING_TEXT)->current_y;
 			}
-			this->SetDirty();
+			this->SetWidgetDirty(WID_A_SCROLLING_TEXT);
 		}
 	}
 };
 
 void ShowAboutWindow()
 {
-	DeleteWindowByClass(WC_GAME_OPTIONS);
+	CloseWindowByClass(WC_GAME_OPTIONS);
 	new AboutWindow();
 }
 
@@ -602,7 +579,7 @@ void ShowEstimatedCostOrIncome(Money cost, int x, int y)
 }
 
 /**
- * Display animated income or costs on the map.
+ * Display animated income or costs on the map. Does nothing if cost is zero.
  * @param x    World X position of the animation location.
  * @param y    World Y position of the animation location.
  * @param z    World Z position of the animation location.
@@ -610,6 +587,9 @@ void ShowEstimatedCostOrIncome(Money cost, int x, int y)
  */
 void ShowCostOrIncomeAnimation(int x, int y, int z, Money cost)
 {
+	if (cost == 0) {
+		return;
+	}
 	Point pt = RemapCoords(x, y, z);
 	StringID msg = STR_INCOME_FLOAT_COST;
 
@@ -692,7 +672,7 @@ void HideFillingPercent(TextEffectID *te_id)
 }
 
 static const NWidgetPart _nested_tooltips_widgets[] = {
-	NWidget(WWT_PANEL, COLOUR_GREY, WID_TT_BACKGROUND), SetMinimalSize(200, 32), EndContainer(),
+	NWidget(WWT_EMPTY, INVALID_COLOUR, WID_TT_BACKGROUND), EndContainer(),
 };
 
 static WindowDesc _tool_tips_desc(
@@ -707,7 +687,7 @@ struct TooltipsWindow : public Window
 {
 	StringID string_id;               ///< String to display as tooltip.
 	byte paramcount;                  ///< Number of string parameters in #string_id.
-	uint64 params[5];                 ///< The string parameters.
+	uint64 params[8];                 ///< The string parameters.
 	TooltipCloseCondition close_cond; ///< Condition for closing the window.
 
 	TooltipsWindow(Window *parent, StringID str, uint paramcount, const uint64 params[], TooltipCloseCondition close_tooltip) : Window(&_tool_tips_desc)
@@ -716,6 +696,10 @@ struct TooltipsWindow : public Window
 		this->string_id = str;
 		static_assert(sizeof(this->params[0]) == sizeof(params[0]));
 		assert(paramcount <= lengthof(this->params));
+		if (params == nullptr) {
+			_global_string_params.offset = 0;
+			params = _global_string_params.GetDataPointer();
+		}
 		if (paramcount > 0) memcpy(this->params, params, sizeof(this->params[0]) * paramcount);
 		this->paramcount = paramcount;
 		this->close_cond = close_tooltip;
@@ -758,44 +742,44 @@ struct TooltipsWindow : public Window
 		/* There is only one widget. */
 		for (uint i = 0; i != this->paramcount; i++) SetDParam(i, this->params[i]);
 
-		size->width  = std::min<uint>(GetStringBoundingBox(this->string_id).width, ScaleGUITrad(250));
+		size->width  = std::min<uint>(GetStringBoundingBox(this->string_id).width, ScaleGUITrad(194));
 		size->height = GetStringHeight(this->string_id, size->width);
 
 		/* Increase slightly to have some space around the box. */
-		size->width  += 2 + WD_FRAMERECT_LEFT + WD_FRAMERECT_RIGHT;
-		size->height += 2 + WD_FRAMERECT_TOP + WD_FRAMERECT_BOTTOM;
+		size->width  += WidgetDimensions::scaled.framerect.Horizontal()  + WidgetDimensions::scaled.fullbevel.Horizontal();
+		size->height += WidgetDimensions::scaled.framerect.Vertical()    + WidgetDimensions::scaled.fullbevel.Vertical();
 	}
 
 	void DrawWidget(const Rect &r, int widget) const override
 	{
 		/* There is only one widget. */
-		GfxFillRect(r.left, r.top, r.right, r.bottom, PC_BLACK);
-		GfxFillRect(r.left + 1, r.top + 1, r.right - 1, r.bottom - 1, PC_LIGHT_YELLOW);
+		GfxFillRect(r, PC_BLACK);
+		GfxFillRect(r.Shrink(WidgetDimensions::scaled.bevel), PC_LIGHT_YELLOW);
 
 		for (uint arg = 0; arg < this->paramcount; arg++) {
 			SetDParam(arg, this->params[arg]);
 		}
-		DrawStringMultiLine(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, r.top + WD_FRAMERECT_TOP, r.bottom - WD_FRAMERECT_BOTTOM, this->string_id, TC_FROMSTRING, SA_CENTER);
+		DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.framerect).Shrink(WidgetDimensions::scaled.fullbevel), this->string_id, TC_FROMSTRING, SA_CENTER);
 	}
 
 	void OnMouseLoop() override
 	{
 		/* Always close tooltips when the cursor is not in our window. */
 		if (!_cursor.in_window) {
-			delete this;
+			this->Close();
 			return;
 		}
 
 		/* We can show tooltips while dragging tools. These are shown as long as
 		 * we are dragging the tool. Normal tooltips work with hover or rmb. */
 		switch (this->close_cond) {
-			case TCC_RIGHT_CLICK: if (!_right_button_down) delete this; break;
-			case TCC_HOVER: if (!_mouse_hovering) delete this; break;
+			case TCC_RIGHT_CLICK: if (!_right_button_down) this->Close(); break;
+			case TCC_HOVER: if (!_mouse_hovering) this->Close(); break;
 			case TCC_NONE: break;
 
 			case TCC_EXIT_VIEWPORT: {
 				Window *w = FindWindowFromPt(_cursor.pos.x, _cursor.pos.y);
-				if (w == nullptr || IsPtInWindowViewport(w, _cursor.pos.x, _cursor.pos.y) == nullptr) delete this;
+				if (w == nullptr || IsPtInWindowViewport(w, _cursor.pos.x, _cursor.pos.y) == nullptr) this->Close();
 				break;
 			}
 		}
@@ -812,7 +796,7 @@ struct TooltipsWindow : public Window
  */
 void GuiShowTooltips(Window *parent, StringID str, uint paramcount, const uint64 params[], TooltipCloseCondition close_tooltip)
 {
-	DeleteWindowById(WC_TOOLTIPS, 0);
+	CloseWindowById(WC_TOOLTIPS, 0);
 
 	if (str == STR_NULL || !_cursor.in_window) return;
 
@@ -856,6 +840,11 @@ void QueryString::HandleEditBox(Window *w, int wid)
 #endif
 }
 
+static int GetCaretWidth()
+{
+	return GetCharacterWidth(FS_NORMAL, '_');
+}
+
 void QueryString::DrawEditBox(const Window *w, int wid) const
 {
 	const NWidgetLeaf *wi = w->GetWidget<NWidgetLeaf>(wid);
@@ -864,29 +853,26 @@ void QueryString::DrawEditBox(const Window *w, int wid) const
 
 	bool rtl = _current_text_dir == TD_RTL;
 	Dimension sprite_size = GetSpriteSize(rtl ? SPR_IMG_DELETE_RIGHT : SPR_IMG_DELETE_LEFT);
-	int clearbtn_width = GetMinButtonSize(sprite_size.width + WD_IMGBTN_LEFT + WD_IMGBTN_RIGHT);
+	int clearbtn_width = sprite_size.width + WidgetDimensions::scaled.imgbtn.Horizontal();
 	clearbtn_width = 0; // Touch interface has it's own keyboard input, and it won't leave space for edit field
 
-	int clearbtn_left  = wi->pos_x + (rtl ? 0 : wi->current_x - clearbtn_width);
-	int clearbtn_right = wi->pos_x + (rtl ? clearbtn_width : wi->current_x) - 1;
-	int left   = wi->pos_x + (rtl ? clearbtn_width : 0);
-	int right  = wi->pos_x + (rtl ? wi->current_x : wi->current_x - clearbtn_width) - 1;
+	Rect r = wi->GetCurrentRect();
+	Rect cr = r.WithWidth(clearbtn_width, !rtl);
+	Rect fr = r.Indent(clearbtn_width, !rtl);
 
-	int top    = wi->pos_y;
-	int bottom = wi->pos_y + wi->current_y - 1;
+	DrawFrameRect(cr, wi->colour, wi->IsLowered() ? FR_LOWERED : FR_NONE);
+	DrawSprite(rtl ? SPR_IMG_DELETE_RIGHT : SPR_IMG_DELETE_LEFT, PAL_NONE, cr.left + WidgetDimensions::scaled.imgbtn.left + (wi->IsLowered() ? 1 : 0), CenterBounds(r.top, r.bottom, sprite_size.height) + (wi->IsLowered() ? 1 : 0));
+	if (this->text.bytes == 1) GfxFillRect(cr.Shrink(WidgetDimensions::scaled.bevel), _colour_gradient[wi->colour & 0xF][2], FILLRECT_CHECKER);
 
 	if (clearbtn_width > 0) {
-		DrawFrameRect(clearbtn_left, top, clearbtn_right, bottom, wi->colour, wi->IsLowered() ? FR_LOWERED : FR_NONE);
-		DrawSprite(rtl ? SPR_IMG_DELETE_RIGHT : SPR_IMG_DELETE_LEFT, PAL_NONE, Center(clearbtn_left + wi->IsLowered(), clearbtn_width, sprite_size.width), Center(top + wi->IsLowered(), bottom - top, sprite_size.height));
-		if (this->text.bytes == 1) GfxFillRect(clearbtn_left + 1, top + 1, clearbtn_right - 1, bottom - 1, _colour_gradient[wi->colour & 0xF][2], FILLRECT_CHECKER);
+	    DrawFrameRect(fr, wi->colour, FR_LOWERED | FR_DARKENED);
+	    GfxFillRect(fr.Shrink(WidgetDimensions::scaled.bevel), PC_BLACK);
 	}
 
-	DrawFrameRect(left, top, right, bottom, wi->colour, FR_LOWERED | FR_DARKENED);
-	GfxFillRect(left + 1, top + 1, right - 1, bottom - 1, PC_BLACK);
-
+	fr = fr.Shrink(WidgetDimensions::scaled.framerect);
 	/* Limit the drawing of the string inside the widget boundaries */
 	DrawPixelInfo dpi;
-	if (!FillDrawPixelInfo(&dpi, left + WD_FRAMERECT_LEFT, top + WD_FRAMERECT_TOP, right - left - WD_FRAMERECT_RIGHT, bottom - top - WD_FRAMERECT_BOTTOM)) return;
+	if (!FillDrawPixelInfo(&dpi, fr.left, fr.top, fr.Width(), fr.Height())) return;
 
 	DrawPixelInfo *old_dpi = _cur_dpi;
 	_cur_dpi = &dpi;
@@ -894,19 +880,18 @@ void QueryString::DrawEditBox(const Window *w, int wid) const
 	/* We will take the current widget length as maximum width, with a small
 	 * space reserved at the end for the caret to show */
 	const Textbuf *tb = &this->text;
-	int delta = std::min(0, (right - left) - tb->pixels - 10);
+	int delta = std::min(0, (fr.right - fr.left) - tb->pixels - GetCaretWidth());
 
 	if (tb->caretxoffs + delta < 0) delta = -tb->caretxoffs;
 
 	/* If we have a marked area, draw a background highlight. */
-	if (tb->marklength != 0) GfxFillRect(delta + tb->markxoffs, 0, delta + tb->markxoffs + tb->marklength - 1, bottom - top, PC_GREY);
+	if (tb->marklength != 0) GfxFillRect(delta + tb->markxoffs, 0, delta + tb->markxoffs + tb->marklength - 1, fr.bottom - fr.top, PC_GREY);
 
-	DrawString(delta, tb->pixels, Center(0, bottom - top), tb->buf, TC_YELLOW);
-
+	DrawString(delta, tb->pixels, 0, tb->buf, TC_YELLOW);
 	bool focussed = w->IsWidgetGloballyFocused(wid) || IsOSKOpenedFor(w, wid);
 	if (focussed && tb->caret) {
 		int caret_width = GetStringBoundingBox("_").width;
-		DrawString(tb->caretxoffs + delta, tb->caretxoffs + delta + caret_width, Center(0, bottom - top), "_", TC_WHITE);
+		DrawString(tb->caretxoffs + delta, tb->caretxoffs + delta + caret_width, 0, "_", TC_WHITE);
 	}
 
 	_cur_dpi = old_dpi;
@@ -926,17 +911,16 @@ Point QueryString::GetCaretPosition(const Window *w, int wid) const
 
 	bool rtl = _current_text_dir == TD_RTL;
 	Dimension sprite_size = GetSpriteSize(rtl ? SPR_IMG_DELETE_RIGHT : SPR_IMG_DELETE_LEFT);
-	int clearbtn_width = sprite_size.width + WD_IMGBTN_LEFT + WD_IMGBTN_RIGHT;
+	int clearbtn_width = sprite_size.width + WidgetDimensions::scaled.imgbtn.Horizontal();
 
-	int left   = wi->pos_x + (rtl ? clearbtn_width : 0);
-	int right  = wi->pos_x + (rtl ? wi->current_x : wi->current_x - clearbtn_width) - 1;
+	Rect r = wi->GetCurrentRect().Indent(clearbtn_width, !rtl).Shrink(WidgetDimensions::scaled.framerect);
 
 	/* Clamp caret position to be inside out current width. */
 	const Textbuf *tb = &this->text;
-	int delta = std::min(0, (right - left) - tb->pixels - 10);
+	int delta = std::min(0, (r.right - r.left) - tb->pixels - GetCaretWidth());
 	if (tb->caretxoffs + delta < 0) delta = -tb->caretxoffs;
 
-	Point pt = {left + WD_FRAMERECT_LEFT + tb->caretxoffs + delta, (int)wi->pos_y + WD_FRAMERECT_TOP};
+	Point pt = {r.left + tb->caretxoffs + delta, r.top};
 	return pt;
 }
 
@@ -956,26 +940,20 @@ Rect QueryString::GetBoundingRect(const Window *w, int wid, const char *from, co
 
 	bool rtl = _current_text_dir == TD_RTL;
 	Dimension sprite_size = GetSpriteSize(rtl ? SPR_IMG_DELETE_RIGHT : SPR_IMG_DELETE_LEFT);
-	int clearbtn_width = sprite_size.width + WD_IMGBTN_LEFT + WD_IMGBTN_RIGHT;
+	int clearbtn_width = sprite_size.width + WidgetDimensions::scaled.imgbtn.Horizontal();
 
-	int left   = wi->pos_x + (rtl ? clearbtn_width : 0);
-	int right  = wi->pos_x + (rtl ? wi->current_x : wi->current_x - clearbtn_width) - 1;
-
-	int top    = wi->pos_y + WD_FRAMERECT_TOP;
-	int bottom = wi->pos_y + wi->current_y - 1 - WD_FRAMERECT_BOTTOM;
+	Rect r = wi->GetCurrentRect().Indent(clearbtn_width, !rtl).Shrink(WidgetDimensions::scaled.framerect);
 
 	/* Clamp caret position to be inside our current width. */
 	const Textbuf *tb = &this->text;
-	int delta = std::min(0, (right - left) - tb->pixels - 10);
+	int delta = std::min(0, r.Width() - tb->pixels - GetCaretWidth());
 	if (tb->caretxoffs + delta < 0) delta = -tb->caretxoffs;
 
 	/* Get location of first and last character. */
 	Point p1 = GetCharPosInString(tb->buf, from, FS_NORMAL);
 	Point p2 = from != to ? GetCharPosInString(tb->buf, to, FS_NORMAL) : p1;
 
-	Rect r = { Clamp(left + p1.x + delta + WD_FRAMERECT_LEFT, left, right), top, Clamp(left + p2.x + delta + WD_FRAMERECT_LEFT, left, right - WD_FRAMERECT_RIGHT), bottom };
-
-	return r;
+	return { Clamp(r.left + p1.x + delta, r.left, r.right), r.top, Clamp(r.left + p2.x + delta, r.left, r.right), r.bottom };
 }
 
 /**
@@ -993,22 +971,18 @@ const char *QueryString::GetCharAtPosition(const Window *w, int wid, const Point
 
 	bool rtl = _current_text_dir == TD_RTL;
 	Dimension sprite_size = GetSpriteSize(rtl ? SPR_IMG_DELETE_RIGHT : SPR_IMG_DELETE_LEFT);
-	int clearbtn_width = sprite_size.width + WD_IMGBTN_LEFT + WD_IMGBTN_RIGHT;
+	int clearbtn_width = sprite_size.width + WidgetDimensions::scaled.imgbtn.Horizontal();
 
-	int left   = wi->pos_x + (rtl ? clearbtn_width : 0);
-	int right  = wi->pos_x + (rtl ? wi->current_x : wi->current_x - clearbtn_width) - 1;
+	Rect r = wi->GetCurrentRect().Indent(clearbtn_width, !rtl).Shrink(WidgetDimensions::scaled.framerect);
 
-	int top    = wi->pos_y + WD_FRAMERECT_TOP;
-	int bottom = wi->pos_y + wi->current_y - 1 - WD_FRAMERECT_BOTTOM;
-
-	if (!IsInsideMM(pt.y, top, bottom)) return nullptr;
+	if (!IsInsideMM(pt.y, r.top, r.bottom)) return nullptr;
 
 	/* Clamp caret position to be inside our current width. */
 	const Textbuf *tb = &this->text;
-	int delta = std::min(0, (right - left) - tb->pixels - 10);
+	int delta = std::min(0, r.Width() - tb->pixels - GetCaretWidth());
 	if (tb->caretxoffs + delta < 0) delta = -tb->caretxoffs;
 
-	return ::GetCharAtPosition(tb->buf, pt.x - delta - left);
+	return ::GetCharAtPosition(tb->buf, pt.x - delta - r.left);
 }
 
 void QueryString::ClickEditBox(Window *w, Point pt, int wid, int click_count, bool focus_changed)
@@ -1020,9 +994,9 @@ void QueryString::ClickEditBox(Window *w, Point pt, int wid, int click_count, bo
 	bool rtl = _current_text_dir == TD_RTL;
 	int clearbtn_width = GetSpriteSize(rtl ? SPR_IMG_DELETE_RIGHT : SPR_IMG_DELETE_LEFT).width;
 
-	int clearbtn_left  = wi->pos_x + (rtl ? 0 : wi->current_x - clearbtn_width);
+	Rect cr = wi->GetCurrentRect().WithWidth(clearbtn_width, !rtl);
 
-	if (IsInsideBS(pt.x, clearbtn_left, clearbtn_width)) {
+	if (IsInsideMM(pt.x, cr.left, cr.right)) {
 		if (this->text.bytes > 1) {
 			this->text.DeleteAll();
 			w->HandleButtonClick(wid);
@@ -1063,7 +1037,7 @@ struct QueryStringWindow : public Window
 	{
 		char *last_of = &this->editbox.text.buf[this->editbox.text.max_bytes - 1];
 		GetString(this->editbox.text.buf, str, last_of);
-		str_validate(this->editbox.text.buf, last_of, SVS_NONE);
+		StrMakeValidInPlace(this->editbox.text.buf, last_of, SVS_NONE);
 
 		/* Make sure the name isn't too long for the text buffer in the number of
 		 * characters (not bytes). max_chars also counts the '\0' characters. */
@@ -1094,9 +1068,9 @@ struct QueryStringWindow : public Window
 	{
 		if (this->flags & QSF_PASSWORD) {
 			assert(this->nested_root->smallest_x > 0);
-			this->warning_size.width = this->nested_root->current_x - (WD_FRAMETEXT_LEFT + WD_FRAMETEXT_RIGHT + WD_FRAMERECT_LEFT + WD_FRAMERECT_RIGHT);
+			this->warning_size.width = this->nested_root->current_x - WidgetDimensions::scaled.frametext.Horizontal() - WidgetDimensions::scaled.framerect.Horizontal();
 			this->warning_size.height = GetStringHeight(STR_WARNING_PASSWORD_SECURITY, this->warning_size.width);
-			this->warning_size.height += WD_FRAMETEXT_TOP + WD_FRAMETEXT_BOTTOM + WD_FRAMERECT_TOP + WD_FRAMERECT_BOTTOM;
+			this->warning_size.height += WidgetDimensions::scaled.frametext.Vertical() + WidgetDimensions::scaled.framerect.Vertical();
 		} else {
 			this->warning_size = Dimension{ 0, 0 };
 		}
@@ -1123,8 +1097,7 @@ struct QueryStringWindow : public Window
 		if (widget != WID_QS_WARNING) return;
 
 		if (this->flags & QSF_PASSWORD) {
-			DrawStringMultiLine(r.left + WD_FRAMERECT_LEFT + WD_FRAMETEXT_LEFT, r.right - WD_FRAMETEXT_RIGHT - WD_FRAMERECT_RIGHT,
-				r.top + WD_FRAMERECT_TOP + WD_FRAMETEXT_TOP, r.bottom - WD_FRAMERECT_BOTTOM - WD_FRAMETEXT_BOTTOM,
+			DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.framerect).Shrink(WidgetDimensions::scaled.frametext),
 				STR_WARNING_PASSWORD_SECURITY, TC_FROMSTRING, SA_CENTER);
 		}
 	}
@@ -1156,18 +1129,19 @@ struct QueryStringWindow : public Window
 				FALLTHROUGH;
 
 			case WID_QS_CANCEL:
-				delete this;
+				this->Close();
 				break;
 		}
 	}
 
-	~QueryStringWindow()
+	void Close() override
 	{
 		if (!this->editbox.handled && this->parent != nullptr) {
 			Window *parent = this->parent;
-			this->parent = nullptr; // so parent doesn't try to delete us again
+			this->parent = nullptr; // so parent doesn't try to close us again
 			parent->OnQueryTextFinished(nullptr);
 		}
+		this->Window::Close();
 	}
 };
 
@@ -1207,7 +1181,7 @@ void ShowQueryString(StringID str, StringID caption, uint maxsize, Window *paren
 {
 	assert(parent != nullptr);
 
-	DeleteWindowByClass(WC_QUERY_STRING);
+	CloseWindowByClass(WC_QUERY_STRING);
 	new QueryStringWindow(str, caption, ((flags & QSF_LEN_IN_CHARS) ? MAX_CHAR_LENGTH : 1) * maxsize, maxsize, &_query_string_desc, parent, afilter, flags);
 }
 
@@ -1233,9 +1207,10 @@ struct QueryWindow : public Window {
 		this->InitNested(WN_CONFIRM_POPUP_QUERY);
 	}
 
-	~QueryWindow()
+	void Close() override
 	{
 		if (this->proc != nullptr) this->proc(this->parent, false);
+		this->Window::Close();
 	}
 
 	void FindWindowPlacementAndResize(int def_width, int def_height) override
@@ -1264,10 +1239,9 @@ struct QueryWindow : public Window {
 	{
 		if (widget != WID_Q_TEXT) return;
 
-		size->width = std::max(GetMinButtonSize() * 8, size->width);
 		Dimension d = GetStringMultiLineBoundingBox(this->message, *size);
-		d.width += WD_FRAMETEXT_LEFT + WD_FRAMETEXT_RIGHT;
-		d.height += WD_FRAMERECT_TOP + WD_FRAMERECT_BOTTOM;
+		d.width += WidgetDimensions::scaled.frametext.Horizontal();
+		d.height += WidgetDimensions::scaled.framerect.Vertical();
 		*size = d;
 	}
 
@@ -1275,7 +1249,7 @@ struct QueryWindow : public Window {
 	{
 		if (widget != WID_Q_TEXT) return;
 
-		DrawStringMultiLine(r.left + WD_FRAMETEXT_LEFT, r.right - WD_FRAMETEXT_RIGHT, r.top + WD_FRAMERECT_TOP, r.bottom - WD_FRAMERECT_BOTTOM,
+		DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.frametext, WidgetDimensions::scaled.framerect),
 				this->message, TC_FROMSTRING, SA_CENTER);
 	}
 
@@ -1284,12 +1258,12 @@ struct QueryWindow : public Window {
 		switch (widget) {
 			case WID_Q_YES: {
 				/* in the Generate New World window, clicking 'Yes' causes
-				 * DeleteNonVitalWindows() to be called - we shouldn't be in a window then */
+				 * CloseNonVitalWindows() to be called - we shouldn't be in a window then */
 				QueryCallbackProc *proc = this->proc;
 				Window *parent = this->parent;
 				/* Prevent the destructor calling the callback function */
 				this->proc = nullptr;
-				delete this;
+				this->Close();
 				if (proc != nullptr) {
 					proc(parent, true);
 					proc = nullptr;
@@ -1297,7 +1271,7 @@ struct QueryWindow : public Window {
 				break;
 			}
 			case WID_Q_NO:
-				delete this;
+				this->Close();
 				break;
 		}
 	}
@@ -1315,7 +1289,7 @@ struct QueryWindow : public Window {
 				FALLTHROUGH;
 
 			case WKC_ESC:
-				delete this;
+				this->Close();
 				return ES_HANDLED;
 		}
 		return ES_NOT_HANDLED;
@@ -1327,11 +1301,13 @@ static const NWidgetPart _nested_query_widgets[] = {
 		NWidget(WWT_CLOSEBOX, COLOUR_RED),
 		NWidget(WWT_CAPTION, COLOUR_RED, WID_Q_CAPTION), SetDataTip(STR_JUST_STRING, STR_NULL),
 	EndContainer(),
-	NWidget(WWT_PANEL, COLOUR_RED), SetPIP(8, 15, 8),
-		NWidget(WWT_TEXT, COLOUR_RED, WID_Q_TEXT), SetMinimalSize(200, 12),
-		NWidget(NWID_HORIZONTAL, NC_EQUALSIZE), SetPIP(20, 29, 20),
-			NWidget(WWT_PUSHTXTBTN, COLOUR_YELLOW, WID_Q_NO), SetMinimalSize(71, 12), SetFill(1, 1), SetDataTip(STR_QUIT_NO, STR_NULL),
-			NWidget(WWT_PUSHTXTBTN, COLOUR_YELLOW, WID_Q_YES), SetMinimalSize(71, 12), SetFill(1, 1), SetDataTip(STR_QUIT_YES, STR_NULL),
+	NWidget(WWT_PANEL, COLOUR_RED),
+		NWidget(NWID_VERTICAL), SetPIP(0, WidgetDimensions::unscaled.vsep_wide, 0), SetPadding(WidgetDimensions::unscaled.modalpopup),
+			NWidget(WWT_TEXT, COLOUR_RED, WID_Q_TEXT), SetMinimalSize(200, 12),
+			NWidget(NWID_HORIZONTAL, NC_EQUALSIZE), SetPIP(WidgetDimensions::unscaled.hsep_indent, WidgetDimensions::unscaled.hsep_indent, WidgetDimensions::unscaled.hsep_indent),
+				NWidget(WWT_PUSHTXTBTN, COLOUR_YELLOW, WID_Q_NO), SetMinimalSize(71, 12), SetFill(1, 1), SetDataTip(STR_QUIT_NO, STR_NULL),
+				NWidget(WWT_PUSHTXTBTN, COLOUR_YELLOW, WID_Q_YES), SetMinimalSize(71, 12), SetFill(1, 1), SetDataTip(STR_QUIT_YES, STR_NULL),
+			EndContainer(),
 		EndContainer(),
 	EndContainer(),
 };
@@ -1356,13 +1332,13 @@ void ShowQuery(StringID caption, StringID message, Window *parent, QueryCallback
 {
 	if (parent == nullptr) parent = FindWindowById(WC_MAIN_WINDOW, 0);
 
-	for (const Window *w : Window::IterateFromBack()) {
+	for (Window *w : Window::Iterate()) {
 		if (w->window_class != WC_CONFIRM_POPUP_QUERY) continue;
 
-		const QueryWindow *qw = (const QueryWindow *)w;
+		QueryWindow *qw = dynamic_cast<QueryWindow *>(w);
 		if (qw->parent != parent || qw->proc != callback) continue;
 
-		delete qw;
+		qw->Close();
 		break;
 	}
 

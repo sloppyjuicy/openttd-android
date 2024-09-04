@@ -13,7 +13,7 @@
 #include "gamelog.h"
 
 /** Type of logged change */
-enum GamelogChangeType {
+enum GamelogChangeType : uint8 {
 	GLCT_MODE,        ///< Scenario editor x Game, different landscape
 	GLCT_REVISION,    ///< Changed game revision string
 	GLCT_OLDVER,      ///< Loaded from savegame without logged data
@@ -81,7 +81,7 @@ struct LoggedAction {
 	LoggedChange *change; ///< First logged change in this action
 	uint32 changes;       ///< Number of changes in this action
 	GamelogActionType at; ///< Type of action
-	uint16 tick;          ///< Tick when it happened
+	uint64 tick;          ///< Tick when it happened
 };
 
 extern LoggedAction *_gamelog_action;

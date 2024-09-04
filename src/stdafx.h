@@ -33,6 +33,7 @@
 #if defined(__HAIKU__)
 #	include <SupportDefs.h>
 #	include <unistd.h>
+#	define _DEFAULT_SOURCE
 #	define _GNU_SOURCE
 #	define TROUBLED_INTS
 #endif
@@ -129,6 +130,7 @@
 	/* Warn about functions using 'printf' format syntax. First argument determines which parameter
 	 * is the format string, second argument is start of values passed to printf. */
 #	define WARN_FORMAT(string, args) __attribute__ ((format (printf, string, args)))
+#	define WARN_TIME_FORMAT(string) __attribute__ ((format (strftime, string, 0)))
 #	if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 7)
 #		define FINAL final
 #	else
@@ -157,6 +159,7 @@
 #	define NORETURN
 #	define CDECL
 #	define WARN_FORMAT(string, args)
+#	define WARN_TIME_FORMAT(string)
 #	define FINAL
 #	define FALLTHROUGH
 #	include <malloc.h>
@@ -205,6 +208,7 @@
 
 #	define CDECL _cdecl
 #	define WARN_FORMAT(string, args)
+#	define WARN_TIME_FORMAT(string)
 #	define FINAL final
 
 	/* fallthrough attribute, VS 2017 */
@@ -299,13 +303,21 @@
 #define PACK(type_dec) PACK_N(type_dec, 1)
 
 /* MSVCRT of course has to have a different syntax for long long *sigh* */
-#if defined(_MSC_VER) || defined(__MINGW32__)
+#if defined(_MSC_VER)
 #   define OTTD_PRINTF64 "%I64d"
+#   define OTTD_PRINTF64U "%I64u"
+#   define OTTD_PRINTFHEX64 "%I64x"
+#   define PRINTF_SIZE "%Iu"
+#   define PRINTF_SIZEX "%IX"
+#elif defined(__MINGW32__)
+#   define OTTD_PRINTF64 "%I64d"
+#   define OTTD_PRINTF64U "%I64llu"
 #   define OTTD_PRINTFHEX64 "%I64x"
 #   define PRINTF_SIZE "%Iu"
 #   define PRINTF_SIZEX "%IX"
 #else
 #   define OTTD_PRINTF64 "%lld"
+#   define OTTD_PRINTF64U "%llu"
 #   define OTTD_PRINTFHEX64 "%llx"
 #   define PRINTF_SIZE "%zu"
 #   define PRINTF_SIZEX "%zX"
@@ -347,7 +359,7 @@ typedef unsigned char byte;
 #endif
 
 /* Define the the platforms that use XDG */
-#if defined(WITH_PERSONAL_DIR) && defined(UNIX) && !defined(__APPLE__)
+#if defined(WITH_PERSONAL_DIR) && defined(UNIX) && !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
 #	define USE_XDG
 #endif
 
@@ -414,12 +426,17 @@ static_assert(SIZE_MAX >= UINT32_MAX);
 #endif /* __APPLE__ */
 
 #if defined(__GNUC__) || defined(__clang__)
-#	define likely(x)   __builtin_expect(!!(x), 1)
-#	define unlikely(x) __builtin_expect(!!(x), 0)
+#	define likely(x)     __builtin_expect(!!(x), 1)
+#	define unlikely(x)   __builtin_expect(!!(x), 0)
+#	define GNU_TARGET(x) [[gnu::target(x)]]
 #else
-#	define likely(x)   (x)
-#	define unlikely(x) (x)
+#	define likely(x)     (x)
+#	define unlikely(x)   (x)
+#	define GNU_TARGET(x)
 #endif /* __GNUC__ || __clang__ */
+
+/* For the FMT library we only want to use the headers, not link to some library. */
+#define FMT_HEADER_ONLY
 
 void NORETURN CDECL usererror(const char *str, ...) WARN_FORMAT(1, 2);
 void NORETURN CDECL error(const char *str, ...) WARN_FORMAT(1, 2);
@@ -429,14 +446,6 @@ void NORETURN CDECL error(const char *str, ...) WARN_FORMAT(1, 2);
 #if defined(NDEBUG) && defined(WITH_ASSERT)
 #	undef assert
 #	define assert(expression) if (unlikely(!(expression))) error("Assertion failed at line %i of %s: %s", __LINE__, __FILE__, #expression);
-#endif
-
-/* Asserts are enabled if NDEBUG isn't defined or WITH_ASSERT is defined. */
-#if !defined(NDEBUG) || defined(WITH_ASSERT)
-#	define OTTD_ASSERT
-#	define assert_msg(expression, msg, ...) if (unlikely(!(expression))) error("Assertion failed at line %i of %s: %s\n\t" msg, __LINE__, __FILE__, #expression, __VA_ARGS__);
-#else
-#	define assert_msg(expression, msg, ...)
 #endif
 
 #if defined(OPENBSD)

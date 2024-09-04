@@ -9,7 +9,15 @@ Module['websocket'] = { url: function(host, port, proto) {
      * If you run your own server you can setup your own WebSocket proxy in
      * front of it and let people connect to your server via the proxy. You
      * are best to add another "if" statement as above for this. */
-    return null;
+
+    if (location.protocol === 'https:') {
+        /* Insecure WebSockets do not work over HTTPS, so we force
+         * secure ones. */
+        return 'wss://';
+    } else {
+        /* Use the default provided by Emscripten. */
+        return null;
+    }
 } };
 
 Module.preRun.push(function() {
@@ -51,13 +59,6 @@ Module.preRun.push(function() {
     window.openttd_syncfs = function() {
         /* Copy the virtual FS to the persistent storage. */
         FS.syncfs(false, function (err) { });
-
-        /* On first time, warn the user about the volatile behaviour of
-         * persistent storage. */
-        if (!window.openttd_syncfs_shown_warning) {
-            window.openttd_syncfs_shown_warning = true;
-            Module.onWarningFs();
-        }
     }
 
     window.openttd_exit = function() {

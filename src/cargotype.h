@@ -15,13 +15,15 @@
 #include "gfx_type.h"
 #include "strings_type.h"
 #include "landscape_type.h"
+#include "core/bitmath_func.hpp"
+#include "core/span_type.hpp"
 #include <vector>
 
 /** Globally unique label of a cargo type. */
 typedef uint32 CargoLabel;
 
 /** Town growth effect when delivering cargo. */
-enum TownEffect {
+enum TownEffect : byte {
 	TE_BEGIN = 0,
 	TE_NONE = TE_BEGIN, ///< Cargo has no effect.
 	TE_PASSENGERS,      ///< Cargo behaves passenger-like.
@@ -59,12 +61,11 @@ struct CargoSpec {
 	uint8 rating_colour;
 	uint8 weight;                    ///< Weight of a single unit of this cargo type in 1/16 ton (62.5 kg).
 	uint16 multiplier;               ///< Capacity multiplier for vehicles. (8 fractional bits)
-	uint32 initial_payment;          ///< Initial payment rate before inflation is applied.
+	int32 initial_payment;           ///< Initial payment rate before inflation is applied.
 	uint8 transit_days[2];
 
 	bool is_freight;                 ///< Cargo type is considered to be freight (affects train freight multiplier).
 	TownEffect town_effect;          ///< The effect that delivering this cargo type has on towns. Also affects destination of subsidies.
-	uint16 multipliertowngrowth;     ///< Size of the effect.
 	uint8 callback_mask;             ///< Bitmask of cargo callbacks that have to be called
 
 	StringID name;                   ///< Name of this type of cargo.
@@ -122,6 +123,13 @@ struct CargoSpec {
 
 	SpriteID GetCargoIcon() const;
 
+	inline uint64 WeightOfNUnits(uint32 n) const
+	{
+		return n * this->weight / 16u;
+	}
+
+	uint64 WeightOfNUnitsInTrain(uint32 n) const;
+
 	/**
 	 * Iterator to iterate all valid CargoSpec
 	 */
@@ -177,10 +185,11 @@ extern CargoTypes _standard_cargo_mask;
 void SetupCargoForClimate(LandscapeID l);
 CargoID GetCargoIDByLabel(CargoLabel cl);
 CargoID GetCargoIDByBitnum(uint8 bitnum);
+CargoID GetDefaultCargoID(LandscapeID l, CargoType ct);
 
 void InitializeSortedCargoSpecs();
 extern std::vector<const CargoSpec *> _sorted_cargo_specs;
-extern uint8 _sorted_standard_cargo_specs_size;
+extern span<const CargoSpec *> _sorted_standard_cargo_specs;
 
 /**
  * Does cargo \a c have cargo class \a cc?
@@ -193,13 +202,6 @@ static inline bool IsCargoInClass(CargoID c, CargoClass cc)
 	return (CargoSpec::Get(c)->classes & cc) != 0;
 }
 
-#define FOR_EACH_SET_CARGO_ID(var, cargo_bits) FOR_EACH_SET_BIT_EX(CargoID, var, CargoTypes, cargo_bits)
-
-/**
- * Loop header for iterating over 'real' cargoes, sorted by name. Phony cargoes like regearing cargoes are skipped.
- * @param var Reference getting the cargospec.
- * @see CargoSpec
- */
-#define FOR_ALL_SORTED_STANDARD_CARGOSPECS(var) for (uint8 index = 0; index < _sorted_standard_cargo_specs_size && (var = _sorted_cargo_specs[index], true); index++)
+using SetCargoBitIterator = SetBitIterator<CargoID, CargoTypes>;
 
 #endif /* CARGOTYPE_H */

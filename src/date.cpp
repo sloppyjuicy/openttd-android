@@ -27,7 +27,7 @@ Year      _cur_year;   ///< Current year, starting at 0
 Month     _cur_month;  ///< Current month (0..11)
 Date      _date;       ///< Current date in days (day counter)
 DateFract _date_fract; ///< Fractional part of the day.
-uint16 _tick_counter;  ///< Ever incrementing (and sometimes wrapping) tick counter for setting off various events
+uint64 _tick_counter;  ///< Ever incrementing tick counter for setting off various events
 
 /**
  * Set the date.
@@ -211,7 +211,7 @@ static void OnNewYear()
 		_cur_year--;
 		days_this_year = IsLeapYear(_cur_year) ? DAYS_IN_LEAP_YEAR : DAYS_IN_YEAR;
 		_date -= days_this_year;
-		for (Vehicle *v : Vehicle::Iterate()) v->date_of_last_service -= days_this_year;
+		for (Vehicle *v : Vehicle::Iterate()) v->ShiftDates(-days_this_year);
 		for (LinkGraph *lg : LinkGraph::Iterate()) lg->ShiftDates(-days_this_year);
 
 		/* Because the _date wraps here, and text-messages expire by game-days, we have to clean out

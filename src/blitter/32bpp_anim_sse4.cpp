@@ -29,6 +29,7 @@ static FBlitter_32bppSSE4_Anim iFBlitter_32bppSSE4_Anim;
  */
 IGNORE_UNINITIALIZED_WARNING_START
 template <BlitterMode mode, Blitter_32bppSSE2::ReadMode read_mode, Blitter_32bppSSE2::BlockType bt_last, bool translucent, bool animated>
+GNU_TARGET("sse4.1")
 inline void Blitter_32bppSSE4_Anim::Draw(const Blitter::BlitterParams *bp, ZoomLevel zoom)
 {
 	const byte * const remap = bp->remap;
@@ -52,6 +53,7 @@ inline void Blitter_32bppSSE4_Anim::Draw(const Blitter::BlitterParams *bp, ZoomL
 	const __m128i a_cm        = ALPHA_CONTROL_MASK;
 	const __m128i pack_low_cm = PACK_LOW_CONTROL_MASK;
 	const __m128i tr_nom_base = TRANSPARENT_NOM_BASE;
+	const __m128i a_am        = ALPHA_AND_MASK;
 
 	for (int y = bp->height; y != 0; y--) {
 		Colour *dst = dst_line;
@@ -143,7 +145,7 @@ inline void Blitter_32bppSSE4_Anim::Draw(const Blitter::BlitterParams *bp, ZoomL
 
 					/* Blend colours. */
 bmno_alpha_blend:
-					srcABCD = AlphaBlendTwoPixels(srcABCD, dstABCD, a_cm, pack_low_cm);
+					srcABCD = AlphaBlendTwoPixels(srcABCD, dstABCD, a_cm, pack_low_cm, a_am);
 bmno_full_opacity:
 					_mm_storel_epi64((__m128i *) dst, srcABCD);
 bmno_full_transparency:
@@ -155,6 +157,7 @@ bmno_full_transparency:
 
 				if ((bt_last == BT_NONE && effective_width & 1) || bt_last == BT_ODD) {
 					if (src->a == 0) {
+						/* Complete transparency. */
 					} else if (src->a == 255) {
 						*anim = *(const uint16*) src_mv;
 						*dst = (src_mv->m >= PALETTE_ANIM_START) ? AdjustBrightneSSE(LookupColourInPalette(src_mv->m), src_mv->v) : *src;
@@ -169,7 +172,7 @@ bmno_full_transparency:
 						} else {
 							srcABCD = _mm_cvtsi32_si128(src->data);
 						}
-						dst->data = _mm_cvtsi128_si32(AlphaBlendTwoPixels(srcABCD, dstABCD, a_cm, pack_low_cm));
+						dst->data = _mm_cvtsi128_si32(AlphaBlendTwoPixels(srcABCD, dstABCD, a_cm, pack_low_cm, a_am));
 					}
 				}
 				break;
@@ -197,7 +200,7 @@ bmno_full_transparency:
 							m_colour = r == 0 ? m_colour : cmap; \
 							m_colour = m != 0 ? m_colour : srcm; \
 							}
-#ifdef _SQ64
+#ifdef POINTER_IS_64BIT
 						uint64 srcs = _mm_cvtsi128_si64(srcABCD);
 						uint64 dsts;
 						if (animated) dsts = _mm_cvtsi128_si64(dstABCD);
@@ -253,7 +256,7 @@ bmno_full_transparency:
 
 					/* Blend colours. */
 bmcr_alpha_blend:
-					srcABCD = AlphaBlendTwoPixels(srcABCD, dstABCD, a_cm, pack_low_cm);
+					srcABCD = AlphaBlendTwoPixels(srcABCD, dstABCD, a_cm, pack_low_cm, a_am);
 bmcr_full_opacity:
 					_mm_storel_epi64((__m128i *) dst, srcABCD);
 bmcr_full_transparency:
@@ -286,7 +289,7 @@ bmcr_full_transparency:
 						if (src->a < 255) {
 bmcr_alpha_blend_single:
 							__m128i dstABCD = _mm_cvtsi32_si128(dst->data);
-							srcABCD = AlphaBlendTwoPixels(srcABCD, dstABCD, a_cm, pack_low_cm);
+							srcABCD = AlphaBlendTwoPixels(srcABCD, dstABCD, a_cm, pack_low_cm, a_am);
 						}
 						dst->data = _mm_cvtsi128_si32(srcABCD);
 					}
@@ -365,6 +368,12 @@ IGNORE_UNINITIALIZED_WARNING_STOP
  */
 void Blitter_32bppSSE4_Anim::Draw(Blitter::BlitterParams *bp, BlitterMode mode, ZoomLevel zoom)
 {
+	if (_screen_disable_anim) {
+		/* This means our output is not to the screen, so we can't be doing any animation stuff, so use our parent Draw() */
+		Blitter_32bppSSE4::Draw(bp, mode, zoom);
+		return;
+	}
+
 	const Blitter_32bppSSE_Base::SpriteFlags sprite_flags = ((const Blitter_32bppSSE_Base::SpriteData *) bp->sprite)->flags;
 	switch (mode) {
 		default: {
@@ -379,7 +388,7 @@ bm_normal:
 					else                           Draw<BM_NORMAL, RM_WITH_SKIP, BT_ODD, true, true>(bp, zoom);
 				}
 			} else {
-#ifdef _SQ64
+#ifdef POINTER_IS_64BIT
 				if (sprite_flags & SF_TRANSLUCENT) {
 					if (sprite_flags & SF_NO_ANIM) Draw<BM_NORMAL, RM_WITH_MARGIN, BT_NONE, true, false>(bp, zoom);
 					else                           Draw<BM_NORMAL, RM_WITH_MARGIN, BT_NONE, true, true>(bp, zoom);

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
     <title>OpenTTD</title>
     <link rel="manifest" href="openttd.webapp">
     <link rel="icon" href="openttd.256.png">
@@ -25,33 +25,8 @@
         z-index: 1;
       }
 
-      div.overlay {
-        height: 40px;
-        margin: 0 auto;
-        opacity: 0;
-        pointer-events: none;
-        position: absolute;
-        text-align: center;
-        transition: opacity 0.3s;
-        width: 100%;
-        z-index: 3;
-      }
-      div.overlay > div {
-        pointer-events: none;
-      }
-
       div.background > div, div.overlay > div {
         margin: auto;
-      }
-
-      #filesystem {
-        background-color: #e00000;
-        border: 1px solid #fc6458;
-        color: #fcf880;
-        display: none;
-        outline: #a00000;
-        padding: 0 4px;
-        width: 600px;
       }
 
       #title, #message {
@@ -104,6 +79,8 @@
         position: absolute;
         width: 100%;
         z-index: 2;
+        /* OpenTTD draws the cursor itself */
+        cursor: none !important;
       }
     </style>
   </head>
@@ -120,16 +97,12 @@
         </div>
       </div>
     </div>
-    <div class="overlay" id="overlay">
-      <div id="filesystem">
-        Warning: savegames are stored in the Indexed DB of your browser.<br/>Your browser can delete savegames without notice!
-      </div>
-    </div>
     <div class="textinput" id="textinput">
       <input type="textinput" id="textinputbox" value="" onfocusout="Module.finishTextInput();" tabindex=1></input>
       <br/>
       <input type="submit" id="textinputbutton" value="OK" onclick="Module.finishTextInput();" ></input>
     </div>
+    <input type="file" id="loadfile" style="display:none"></input>
     <div>
       <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex=-1></canvas>
     </div>
@@ -213,17 +186,6 @@
           document.getElementById("message").innerHTML = "The game crashed!<br/><br/>Please reload your browser to restart the game.";
         },
 
-        onWarningFs: function() {
-          document.getElementById("filesystem").style.display = "inline-block";
-          document.getElementById("overlay").style.opacity = 1;
-          setTimeout(function() {
-            document.getElementById("overlay").style.opacity = 0;
-            setTimeout(function() {
-              document.getElementById("filesystem").style.display = "none";
-            }, 300);
-          }, 10000);
-        },
-
         textInputValue: null,
 
         startTextInput: function(text) {
@@ -267,6 +229,7 @@
       };
 
       document.getElementById("textinput").style.display = "none"; // It's not hiding with CSS
+      //document.getElementById("loadfile").style.display = "none";
       document.getElementById("canvas").focus();
 
       window.onerror = function() {

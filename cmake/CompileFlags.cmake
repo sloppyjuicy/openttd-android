@@ -26,8 +26,10 @@ macro(compile_flags)
         add_compile_options(/Zc:rvalueCast)
 
         if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-            # Enable multi-threaded compilation.
-            add_compile_options(/MP)
+            add_compile_options(
+                /MP # Enable multi-threaded compilation.
+                /FC # Display the full path of source code files passed to the compiler in diagnostics.
+            )
         endif()
     endif()
 
@@ -41,6 +43,11 @@ macro(compile_flags)
         add_link_options(
             "$<$<NOT:$<CONFIG:Debug>>:-fstack-protector>" # Prevent undefined references when _FORTIFY_SOURCE > 0
         )
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            add_compile_options(
+                "$<$<CONFIG:Debug>:-Wa,-mbig-obj>" # Switch to pe-bigobj-x86-64 as x64 Debug builds push pe-x86-64 to the limits (linking errors with ASLR, ...)
+            )
+        endif()
     endif()
 
     # Prepare a generator that checks if we are not a debug, and don't have asserts
@@ -49,6 +56,11 @@ macro(compile_flags)
 
     if(MSVC)
         add_compile_options(/W3)
+        if(MSVC_VERSION GREATER 1929 AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+            # Starting with version 19.30, there is an optimisation bug, see #9966 for details
+            # This flag disables the broken optimisation to work around the bug
+            add_compile_options(/d2ssa-rse-)
+        endif()
     elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
         add_compile_options(
             -W
@@ -156,7 +168,7 @@ macro(compile_flags)
         message(FATAL_ERROR "No warning flags are set for this compiler yet; please consider creating a Pull Request to add support for this compiler.")
     endif()
 
-    if(NOT WIN32)
+    if(NOT WIN32 AND NOT HAIKU)
         # rdynamic is used to get useful stack traces from crash reports.
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
     endif()

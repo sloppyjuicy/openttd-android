@@ -13,10 +13,6 @@ add_files(
     8bpp_optimized.hpp
     8bpp_simple.cpp
     8bpp_simple.hpp
-    16bpp_base.cpp
-    16bpp_base.hpp
-    16bpp_simple.cpp
-    16bpp_simple.hpp
     CONDITION NOT OPTION_DEDICATED
 )
 
@@ -41,21 +37,6 @@ add_files(
     40bpp_anim.hpp
     CONDITION NOT OPTION_DEDICATED AND OPENGL_FOUND
 )
-
-
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-    set_compile_flags(
-        32bpp_anim_sse2.cpp
-        32bpp_sse2.cpp
-        COMPILE_FLAGS -msse2)
-    set_compile_flags(
-        32bpp_ssse3.cpp
-        COMPILE_FLAGS -mssse3)
-    set_compile_flags(
-        32bpp_anim_sse4.cpp
-        32bpp_sse4.cpp
-        COMPILE_FLAGS -msse4.1)
-endif()
 
 add_files(
     base.hpp

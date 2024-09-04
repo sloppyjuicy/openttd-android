@@ -32,6 +32,9 @@
 #include "date_func.h"
 #include "newgrf_debug.h"
 #include "vehicle_func.h"
+#include "station_func.h"
+#include "object_cmd.h"
+#include "landscape_cmd.h"
 
 #include "table/strings.h"
 #include "table/object_land.h"
@@ -114,14 +117,16 @@ void BuildObject(ObjectType type, TileIndex tile, CompanyID owner, Town *town, u
 
 	assert(o->town != nullptr);
 
-	TILE_AREA_LOOP(t, ta) {
+	for (TileIndex t : ta) {
 		WaterClass wc = (IsWaterTile(t) ? GetWaterClass(t) : WATER_CLASS_INVALID);
 		/* Update company infrastructure counts for objects build on canals owned by nobody. */
 		if (wc == WATER_CLASS_CANAL && owner != OWNER_NONE && (IsTileOwner(tile, OWNER_NONE) || IsTileOwner(tile, OWNER_WATER))) {
 			Company::Get(owner)->infrastructure.water++;
 			DirtyCompanyInfrastructureWindows(owner);
 		}
+		bool remove = IsDockingTile(t);
 		MakeObject(t, owner, o->index, wc, Random());
+		if (remove) RemoveDockingTile(t);
 		MarkTileDirtyByTile(t);
 	}
 
@@ -136,7 +141,7 @@ void BuildObject(ObjectType type, TileIndex tile, CompanyID owner, Town *town, u
 static void IncreaseAnimationStage(TileIndex tile)
 {
 	TileArea ta = Object::GetByTile(tile)->location;
-	TILE_AREA_LOOP(t, ta) {
+	for (TileIndex t : ta) {
 		SetAnimationFrame(t, GetAnimationFrame(t) + 1);
 		MarkTileDirtyByTile(t);
 	}
@@ -192,20 +197,17 @@ static CommandCost ClearTile_Object(TileIndex tile, DoCommandFlag flags);
 
 /**
  * Build an object object
- * @param tile tile where the object will be located
  * @param flags type of operation
- * @param p1 the object type to build
- * @param p2 the view for the object
- * @param text unused
+ * @param tile tile where the object will be located
+ * @param type the object type to build
+ * @param view the view for the object
  * @return the cost of this operation or an error
  */
-CommandCost CmdBuildObject(TileIndex tile, DoCommandFlag flags, uint32 p1, uint32 p2, const char *text)
+CommandCost CmdBuildObject(DoCommandFlag flags, TileIndex tile, ObjectType type, uint8 view)
 {
-	CommandCost cost(EXPENSES_PROPERTY);
+	CommandCost cost(EXPENSES_CONSTRUCTION);
 
-	ObjectType type = (ObjectType)GB(p1, 0, 16);
 	if (type >= NUM_OBJECTS) return CMD_ERROR;
-	uint8 view = GB(p2, 0, 2);
 	const ObjectSpec *spec = ObjectSpec::Get(type);
 	if (_game_mode == GM_NORMAL && !spec->IsAvailable() && !_generating_world) return CMD_ERROR;
 	if ((_game_mode == GM_EDITOR || _generating_world) && !spec->WasEverAvailable()) return CMD_ERROR;
@@ -220,23 +222,26 @@ CommandCost CmdBuildObject(TileIndex tile, DoCommandFlag flags, uint32 p1, uint3
 	int size_x = GB(spec->size, HasBit(view, 0) ? 4 : 0, 4);
 	int size_y = GB(spec->size, HasBit(view, 0) ? 0 : 4, 4);
 	TileArea ta(tile, size_x, size_y);
+	for (TileIndex t : ta) {
+		if (!IsValidTile(t)) return_cmd_error(STR_ERROR_TOO_CLOSE_TO_EDGE_OF_MAP_SUB); // Might be off the map
+	}
 
 	if (type == OBJECT_OWNED_LAND) {
 		/* Owned land is special as it can be placed on any slope. */
-		cost.AddCost(DoCommand(tile, 0, 0, flags, CMD_LANDSCAPE_CLEAR));
+		cost.AddCost(Command<CMD_LANDSCAPE_CLEAR>::Do(flags, tile));
 	} else {
 		/* Check the surface to build on. At this time we can't actually execute the
 		 * the CLEAR_TILE commands since the newgrf callback later on can check
 		 * some information about the tiles. */
 		bool allow_water = (spec->flags & (OBJECT_FLAG_BUILT_ON_WATER | OBJECT_FLAG_NOT_ON_LAND)) != 0;
 		bool allow_ground = (spec->flags & OBJECT_FLAG_NOT_ON_LAND) == 0;
-		TILE_AREA_LOOP(t, ta) {
+		for (TileIndex t : ta) {
 			if (HasTileWaterGround(t)) {
 				if (!allow_water) return_cmd_error(STR_ERROR_CAN_T_BUILD_ON_WATER);
 				if (!IsWaterTile(t)) {
 					/* Normal water tiles don't have to be cleared. For all other tile types clear
 					 * the tile but leave the water. */
-					cost.AddCost(DoCommand(t, 0, 0, flags & ~DC_NO_WATER & ~DC_EXEC, CMD_LANDSCAPE_CLEAR));
+					cost.AddCost(Command<CMD_LANDSCAPE_CLEAR>::Do(flags & ~DC_NO_WATER & ~DC_EXEC, t));
 				} else {
 					/* Can't build on water owned by another company. */
 					Owner o = GetTileOwner(t);
@@ -254,7 +259,7 @@ CommandCost CmdBuildObject(TileIndex tile, DoCommandFlag flags, uint32 p1, uint3
 						IsTileType(t, MP_OBJECT) &&
 						IsTileOwner(t, _current_company) &&
 						IsObjectType(t, OBJECT_HQ))) {
-					cost.AddCost(DoCommand(t, 0, 0, flags & ~DC_EXEC, CMD_LANDSCAPE_CLEAR));
+					cost.AddCost(Command<CMD_LANDSCAPE_CLEAR>::Do(flags & ~DC_EXEC, t));
 				}
 			}
 		}
@@ -263,7 +268,7 @@ CommandCost CmdBuildObject(TileIndex tile, DoCommandFlag flags, uint32 p1, uint3
 		int allowed_z;
 		if (GetTileSlope(tile, &allowed_z) != SLOPE_FLAT) allowed_z++;
 
-		TILE_AREA_LOOP(t, ta) {
+		for (TileIndex t : ta) {
 			uint16 callback = CALLBACK_FAILED;
 			if (HasBit(spec->callback_mask, CBM_OBJ_SLOPE_CHECK)) {
 				TileIndex diff = t - tile;
@@ -283,13 +288,13 @@ CommandCost CmdBuildObject(TileIndex tile, DoCommandFlag flags, uint32 p1, uint3
 		if (flags & DC_EXEC) {
 			/* This is basically a copy of the loop above with the exception that we now
 			 * execute the commands and don't check for errors, since that's already done. */
-			TILE_AREA_LOOP(t, ta) {
+			for (TileIndex t : ta) {
 				if (HasTileWaterGround(t)) {
 					if (!IsWaterTile(t)) {
-						DoCommand(t, 0, 0, (flags & ~DC_NO_WATER) | DC_NO_MODIFY_TOWN_RATING, CMD_LANDSCAPE_CLEAR);
+						Command<CMD_LANDSCAPE_CLEAR>::Do((flags & ~DC_NO_WATER) | DC_NO_MODIFY_TOWN_RATING, t);
 					}
 				} else {
-					DoCommand(t, 0, 0, flags | DC_NO_MODIFY_TOWN_RATING, CMD_LANDSCAPE_CLEAR);
+					Command<CMD_LANDSCAPE_CLEAR>::Do(flags | DC_NO_MODIFY_TOWN_RATING, t);
 				}
 			}
 		}
@@ -297,7 +302,7 @@ CommandCost CmdBuildObject(TileIndex tile, DoCommandFlag flags, uint32 p1, uint3
 	if (cost.Failed()) return cost;
 
 	/* Finally do a check for bridges. */
-	TILE_AREA_LOOP(t, ta) {
+	for (TileIndex t : ta) {
 		if (IsBridgeAbove(t) && (
 				!(spec->flags & OBJECT_FLAG_ALLOW_UNDER_BRIDGE) ||
 				(GetTileMaxZ(t) + spec->height >= GetBridgeHeight(GetSouthernBridgeEnd(t))))) {
@@ -306,6 +311,7 @@ CommandCost CmdBuildObject(TileIndex tile, DoCommandFlag flags, uint32 p1, uint3
 	}
 
 	int hq_score = 0;
+	uint build_object_size = 1;
 	switch (type) {
 		case OBJECT_TRANSMITTER:
 		case OBJECT_LIGHTHOUSE:
@@ -323,6 +329,8 @@ CommandCost CmdBuildObject(TileIndex tile, DoCommandFlag flags, uint32 p1, uint3
 		case OBJECT_HQ: {
 			Company *c = Company::Get(_current_company);
 			if (c->location_of_HQ != INVALID_TILE) {
+				/* Don't relocate HQ on the same location. */
+				if (c->location_of_HQ == tile) return_cmd_error(STR_ERROR_ALREADY_BUILT);
 				/* We need to persuade a bit harder to remove the old HQ. */
 				_current_company = OWNER_WATER;
 				cost.AddCost(ClearTile_Object(c->location_of_HQ, flags));
@@ -342,20 +350,85 @@ CommandCost CmdBuildObject(TileIndex tile, DoCommandFlag flags, uint32 p1, uint3
 			return CMD_ERROR;
 
 		default: // i.e. NewGRF provided.
+			build_object_size = size_x * size_y;
 			break;
 	}
 
+	/* Don't allow building more objects if the company has reached its limit. */
+	Company *c = Company::GetIfValid(_current_company);
+	if (c != nullptr && GB(c->build_object_limit, 16, 16) < build_object_size) {
+		return_cmd_error(STR_ERROR_BUILD_OBJECT_LIMIT_REACHED);
+	}
+
 	if (flags & DC_EXEC) {
-		BuildObject(type, tile, _current_company, nullptr, view);
+		BuildObject(type, tile, _current_company == OWNER_DEITY ? OWNER_NONE : _current_company, nullptr, view);
 
 		/* Make sure the HQ starts at the right size. */
 		if (type == OBJECT_HQ) UpdateCompanyHQ(tile, hq_score);
+
+		/* Subtract the tile from the build limit. */
+		if (c != nullptr) c->build_object_limit -= build_object_size << 16;
 	}
 
-	cost.AddCost(ObjectSpec::Get(type)->GetBuildCost() * size_x * size_y);
+	cost.AddCost(spec->GetBuildCost() * build_object_size);
 	return cost;
 }
 
+/**
+ * Construct multiple objects in an area
+ * @param flags of operation to conduct
+ * @param tile end tile of area dragging
+ * @param start_tile start tile of area dragging
+ * @param type the object type to build
+ * @param view the view for the object
+ * @param diagonal Whether to use the Orthogonal (0) or Diagonal (1) iterator.
+ * @return the cost of this operation or an error
+ */
+CommandCost CmdBuildObjectArea(DoCommandFlag flags, TileIndex tile, TileIndex start_tile, ObjectType type, uint8 view, bool diagonal)
+{
+	if (start_tile >= MapSize()) return CMD_ERROR;
+
+	if (type >= NUM_OBJECTS) return CMD_ERROR;
+	const ObjectSpec *spec = ObjectSpec::Get(type);
+	if (view >= spec->views) return CMD_ERROR;
+
+	if (spec->size != OBJECT_SIZE_1X1) return CMD_ERROR;
+
+	Money money = GetAvailableMoneyForCommand();
+	CommandCost cost(EXPENSES_CONSTRUCTION);
+	CommandCost last_error = CMD_ERROR;
+	bool had_success = false;
+
+	const Company *c = Company::GetIfValid(_current_company);
+	int limit = (c == nullptr ? INT32_MAX : GB(c->build_object_limit, 16, 16));
+
+	TileIterator *iter = diagonal ? (TileIterator *)new DiagonalTileIterator(tile, start_tile) : new OrthogonalTileIterator(tile, start_tile);
+	for (; *iter != INVALID_TILE; ++(*iter)) {
+		TileIndex t = *iter;
+		CommandCost ret = Command<CMD_BUILD_OBJECT>::Do(flags & ~DC_EXEC, t, type, view);
+
+		/* If we've reached the limit, stop building (or testing). */
+		if (c != nullptr && limit-- <= 0) break;
+
+		if (ret.Failed()) {
+			last_error = ret;
+			continue;
+		}
+
+		had_success = true;
+		if (flags & DC_EXEC) {
+			money -= ret.GetCost();
+
+			/* If we run out of money, stop building. */
+			if (ret.GetCost() > 0 && money < 0) break;
+			Command<CMD_BUILD_OBJECT>::Do(flags, t, type, view);
+		}
+		cost.AddCost(ret);
+	}
+
+	delete iter;
+	return had_success ? cost : last_error;
+}
 
 static Foundation GetFoundation_Object(TileIndex tile, Slope tileh);
 
@@ -438,7 +511,7 @@ static Foundation GetFoundation_Object(TileIndex tile, Slope tileh)
 static void ReallyClearObjectTile(Object *o)
 {
 	Object::DecTypeCount(o->type);
-	TILE_AREA_LOOP(tile_cur, o->location) {
+	for (TileIndex tile_cur : o->location) {
 		DeleteNewGRFInspectWindow(GSF_OBJECTS, tile_cur);
 
 		MakeWaterKeepingClass(tile_cur, GetTileOwner(tile_cur));
@@ -520,7 +593,7 @@ static CommandCost ClearTile_Object(TileIndex tile, DoCommandFlag flags)
 			}
 
 			/* cost of relocating company is 1% of company value */
-			cost = CommandCost(EXPENSES_PROPERTY, CalculateCompanyValue(c) / 100);
+			cost = CommandCost(EXPENSES_CONSTRUCTION, CalculateCompanyValue(c) / 100);
 			break;
 		}
 
@@ -769,7 +842,7 @@ void GenerateObjects()
 
 				default:
 					uint8 view = RandomRange(spec->views);
-					if (CmdBuildObject(RandomTile(), DC_EXEC | DC_AUTO | DC_NO_TEST_TOWN_RATING | DC_NO_MODIFY_TOWN_RATING, i, view, nullptr).Succeeded()) amount--;
+					if (CmdBuildObject(DC_EXEC | DC_AUTO | DC_NO_TEST_TOWN_RATING | DC_NO_MODIFY_TOWN_RATING, RandomTile(), i, view).Succeeded()) amount--;
 					break;
 			}
 		}
@@ -841,7 +914,7 @@ static CommandCost TerraformTile_Object(TileIndex tile, DoCommandFlag flags, int
 		}
 	}
 
-	return DoCommand(tile, 0, 0, flags, CMD_LANDSCAPE_CLEAR);
+	return Command<CMD_LANDSCAPE_CLEAR>::Do(flags, tile);
 }
 
 extern const TileTypeProcs _tile_type_object_procs = {

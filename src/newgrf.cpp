@@ -27,6 +27,7 @@
 #include "newgrf_sound.h"
 #include "newgrf_station.h"
 #include "industrytype.h"
+#include "industry_map.h"
 #include "newgrf_canal.h"
 #include "newgrf_townname.h"
 #include "newgrf_industries.h"
@@ -38,7 +39,7 @@
 #include "strings_func.h"
 #include "date_func.h"
 #include "string_func.h"
-#include "network/network.h"
+#include "network/core/config.h"
 #include <map>
 #include "smallmap_gui.h"
 #include "genworld.h"
@@ -99,17 +100,16 @@ public:
 	SpriteID spriteid;        ///< First available SpriteID for loading realsprites.
 
 	/* Local state in the file */
-	uint file_index;          ///< File index of currently processed GRF file.
+	SpriteFile *file;         ///< File of currently processed GRF file.
 	GRFFile *grffile;         ///< Currently processed GRF file.
 	GRFConfig *grfconfig;     ///< Config of the currently processed GRF file.
 	uint32 nfo_line;          ///< Currently processed pseudo sprite number in the GRF.
-	byte grf_container_ver;   ///< Container format of the current GRF file.
 
 	/* Kind of return values when processing certain actions */
 	int skip_sprites;         ///< Number of pseudo sprites to skip before processing the next one. (-1 to skip to end of file)
 
 	/* Currently referenceable spritegroups */
-	SpriteGroup *spritegroups[MAX_SPRITEGROUP + 1];
+	const SpriteGroup *spritegroups[MAX_SPRITEGROUP + 1];
 
 	/** Clear temporary data before processing the next file in the current loading stage */
 	void ClearDataForNextFile()
@@ -328,7 +328,6 @@ struct GRFTempEngineData {
 	uint8 roadtramtype;
 	const GRFFile *defaultcargo_grf; ///< GRF defining the cargo translation table to use if the default cargo is the 'first refittable'.
 	Refittability refittability;     ///< Did the newgrf set any refittability property? If not, default refittability will be applied.
-	bool prop27_set;         ///< Did the NewGRF set property 27 (misc flags)?
 	uint8 rv_max_speed;      ///< Temporary storage of RV prop 15, maximum speed in mph/0.8
 	CargoTypes ctt_include_mask; ///< Cargo types always included in the refit mask.
 	CargoTypes ctt_exclude_mask; ///< Cargo types always excluded from the refit mask.
@@ -380,8 +379,8 @@ typedef std::map<GRFLocation, byte*> GRFLineToSpriteOverride;
 static GRFLineToSpriteOverride _grf_line_to_action6_sprite_override;
 
 /**
- * DEBUG() function dedicated to newGRF debugging messages
- * Function is essentially the same as DEBUG(grf, severity, ...) with the
+ * Debug() function dedicated to newGRF debugging messages
+ * Function is essentially the same as Debug(grf, severity, ...) with the
  * addition of file:line information when parsing grf files.
  * NOTE: for the above reason(s) grfmsg() should ONLY be used for
  * loading/parsing grf files, not for runtime debug messages as there
@@ -398,7 +397,7 @@ void CDECL grfmsg(int severity, const char *str, ...)
 	vseprintf(buf, lastof(buf), str, va);
 	va_end(va);
 
-	DEBUG(grf, severity, "[%s:%d] %s", _cur.grfconfig->filename, _cur.nfo_line, buf);
+	Debug(grf, severity, "[{}:{}] {}", _cur.grfconfig->filename, _cur.nfo_line, buf);
 }
 
 /**
@@ -430,13 +429,7 @@ static GRFFile *GetFileByFilename(const char *filename)
 /** Reset all NewGRFData that was used only while processing data */
 static void ClearTemporaryNewGRFData(GRFFile *gf)
 {
-	/* Clear the GOTO labels used for GRF processing */
-	for (GRFLabel *l = gf->label; l != nullptr;) {
-		GRFLabel *l2 = l->next;
-		free(l);
-		l = l2;
-	}
-	gf->label = nullptr;
+	gf->labels.clear();
 }
 
 /**
@@ -549,7 +542,7 @@ static StringID TTDPStringIDToOTTDStringIDMapping(StringID str)
 
 	if (str == STR_NULL) return STR_EMPTY;
 
-	DEBUG(grf, 0, "Unknown StringID 0x%04X remapped to STR_EMPTY. Please open a Feature Request if you need it", str);
+	Debug(grf, 0, "Unknown StringID 0x{:04X} remapped to STR_EMPTY. Please open a Feature Request if you need it", str);
 
 	return STR_EMPTY;
 }
@@ -961,8 +954,7 @@ static bool ReadSpriteLayout(ByteReader *buf, uint num_building_sprites, bool us
 static CargoTypes TranslateRefitMask(uint32 refit_mask)
 {
 	CargoTypes result = 0;
-	uint8 bit;
-	FOR_EACH_SET_BIT(bit, refit_mask) {
+	for (uint8 bit : SetBitIterator(refit_mask)) {
 		CargoID cargo = GetCargoTranslation(bit, _cur.grffile, true);
 		if (cargo != CT_INVALID) SetBit(result, cargo);
 	}
@@ -1296,7 +1288,6 @@ static ChangeInfoResult RailVehicleChangeInfo(uint engine, int numinfo, int prop
 			case 0x27: // Miscellaneous flags
 				ei->misc_flags = buf->ReadByte();
 				_loaded_newgrf_features.has_2CC |= HasBit(ei->misc_flags, EF_USES_2CC);
-				_gted[e->index].prop27_set = true;
 				break;
 
 			case 0x28: // Cargo classes allowed
@@ -1332,6 +1323,18 @@ static ChangeInfoResult RailVehicleChangeInfo(uint engine, int numinfo, int prop
 				}
 				break;
 			}
+
+			case PROP_TRAIN_CURVE_SPEED_MOD: // 0x2E Curve speed modifier
+				rvi->curve_speed_mod = buf->ReadWord();
+				break;
+
+			case 0x2F: // Engine variant
+				ei->variant_id = GetNewEngineID(_cur.grffile, VEH_TRAIN, buf->ReadWord());
+				break;
+
+			case 0x30: // Extra miscellaneous flags
+				ei->extra_flags = static_cast<ExtraEngineFlags>(buf->ReadDWord());
+				break;
 
 			default:
 				ret = CommonVehicleChangeInfo(ei, prop, buf);
@@ -1527,6 +1530,14 @@ static ChangeInfoResult RoadVehicleChangeInfo(uint engine, int numinfo, int prop
 				break;
 			}
 
+			case 0x26: // Engine variant
+				ei->variant_id = GetNewEngineID(_cur.grffile, VEH_ROAD, buf->ReadWord());
+				break;
+
+			case 0x27: // Extra miscellaneous flags
+				ei->extra_flags = static_cast<ExtraEngineFlags>(buf->ReadDWord());
+				break;
+
 			default:
 				ret = CommonVehicleChangeInfo(ei, prop, buf);
 				break;
@@ -1699,6 +1710,14 @@ static ChangeInfoResult ShipVehicleChangeInfo(uint engine, int numinfo, int prop
 				break;
 			}
 
+			case 0x20: // Engine variant
+				ei->variant_id = GetNewEngineID(_cur.grffile, VEH_SHIP, buf->ReadWord());
+				break;
+
+			case 0x21: // Extra miscellaneous flags
+				ei->extra_flags = static_cast<ExtraEngineFlags>(buf->ReadDWord());
+				break;
+
 			default:
 				ret = CommonVehicleChangeInfo(ei, prop, buf);
 				break;
@@ -1853,6 +1872,14 @@ static ChangeInfoResult AircraftVehicleChangeInfo(uint engine, int numinfo, int 
 				avi->max_range = buf->ReadWord();
 				break;
 
+			case 0x20: // Engine variant
+				ei->variant_id = GetNewEngineID(_cur.grffile, VEH_AIRCRAFT, buf->ReadWord());
+				break;
+
+			case 0x21: // Extra miscellaneous flags
+				ei->extra_flags = static_cast<ExtraEngineFlags>(buf->ReadDWord());
+				break;
+
 			default:
 				ret = CommonVehicleChangeInfo(ei, prop, buf);
 				break;
@@ -1944,6 +1971,12 @@ static ChangeInfoResult StationChangeInfo(uint stid, int numinfo, int prop, Byte
 						if (_cur.skip_sprites < 0) return CIR_DISABLED;
 					}
 					dts->Clone(tmp_layout.data());
+				}
+
+				/* Number of layouts must be even, alternating X and Y */
+				if (statspec->renderdata.size() & 1) {
+					grfmsg(1, "StationChangeInfo: Station %u defines an odd number of sprite layouts, dropping the last item", stid + i);
+					statspec->renderdata.pop_back();
 				}
 				break;
 			}
@@ -2066,6 +2099,12 @@ static ChangeInfoResult StationChangeInfo(uint stid, int numinfo, int prop, Byte
 					uint num_building_sprites = buf->ReadByte();
 					/* On error, bail out immediately. Temporary GRF data was already freed */
 					if (ReadSpriteLayout(buf, num_building_sprites, false, GSF_STATIONS, true, false, dts)) return CIR_DISABLED;
+				}
+
+				/* Number of layouts must be even, alternating X and Y */
+				if (statspec->renderdata.size() & 1) {
+					grfmsg(1, "StationChangeInfo: Station %u defines an odd number of sprite layouts, dropping the last item", stid + i);
+					statspec->renderdata.pop_back();
 				}
 				break;
 			}
@@ -2588,6 +2627,22 @@ static ChangeInfoResult LoadTranslationTable(uint gvid, int numinfo, ByteReader 
 }
 
 /**
+ * Helper to read a DWord worth of bytes from the reader
+ * and to return it as a valid string.
+ * @param reader The source of the DWord.
+ * @return The read DWord as string.
+ */
+static std::string ReadDWordAsString(ByteReader *reader)
+{
+	char output[5];
+	for (int i = 0; i < 4; i++) output[i] = reader->ReadByte();
+	output[4] = '\0';
+	StrMakeValidInPlace(output, lastof(output));
+
+	return std::string(output);
+}
+
+/**
  * Define properties for global variables
  * @param gvid ID of the global variable.
  * @param numinfo Number of subsequent IDs to change the property for.
@@ -2661,8 +2716,8 @@ static ChangeInfoResult GlobalVarChangeInfo(uint gvid, int numinfo, int prop, By
 				uint16 options = buf->ReadWord();
 
 				if (curidx < CURRENCY_END) {
-					_currency_specs[curidx].separator[0] = GB(options, 0, 8);
-					_currency_specs[curidx].separator[1] = '\0';
+					_currency_specs[curidx].separator.clear();
+					_currency_specs[curidx].separator.push_back(GB(options, 0, 8));
 					/* By specifying only one bit, we prevent errors,
 					 * since newgrf specs said that only 0 and 1 can be set for symbol_pos */
 					_currency_specs[curidx].symbol_pos = GB(options, 8, 1);
@@ -2674,11 +2729,10 @@ static ChangeInfoResult GlobalVarChangeInfo(uint gvid, int numinfo, int prop, By
 
 			case 0x0D: { // Currency prefix symbol
 				uint curidx = GetNewgrfCurrencyIdConverted(gvid + i);
-				uint32 tempfix = buf->ReadDWord();
+				std::string prefix = ReadDWordAsString(buf);
 
 				if (curidx < CURRENCY_END) {
-					memcpy(_currency_specs[curidx].prefix, &tempfix, 4);
-					_currency_specs[curidx].prefix[4] = 0;
+					_currency_specs[curidx].prefix = prefix;
 				} else {
 					grfmsg(1, "GlobalVarChangeInfo: Currency symbol %d out of range, ignoring", curidx);
 				}
@@ -2687,11 +2741,10 @@ static ChangeInfoResult GlobalVarChangeInfo(uint gvid, int numinfo, int prop, By
 
 			case 0x0E: { // Currency suffix symbol
 				uint curidx = GetNewgrfCurrencyIdConverted(gvid + i);
-				uint32 tempfix = buf->ReadDWord();
+				std::string suffix = ReadDWordAsString(buf);
 
 				if (curidx < CURRENCY_END) {
-					memcpy(&_currency_specs[curidx].suffix, &tempfix, 4);
-					_currency_specs[curidx].suffix[4] = 0;
+					_currency_specs[curidx].suffix = suffix;
 				} else {
 					grfmsg(1, "GlobalVarChangeInfo: Currency symbol %d out of range, ignoring", curidx);
 				}
@@ -3003,7 +3056,7 @@ static ChangeInfoResult CargoChangeInfo(uint cid, int numinfo, int prop, ByteRea
 			}
 
 			case 0x19: // Town growth coefficient
-				cs->multipliertowngrowth = buf->ReadWord();
+				buf->ReadWord();
 				break;
 
 			case 0x1A: // Bitmask of callbacks to use
@@ -3171,7 +3224,7 @@ static ChangeInfoResult IndustrytilesChangeInfo(uint indtid, int numinfo, int pr
 
 					/* A copied tile should not have the animation infos copied too.
 					 * The anim_state should be left untouched, though
-					 * It is up to the author to animate them himself */
+					 * It is up to the author to animate them */
 					tsp->anim_production = INDUSTRYTILE_NOANIM;
 					tsp->anim_next = INDUSTRYTILE_NOANIM;
 
@@ -3358,6 +3411,8 @@ static ChangeInfoResult IgnoreIndustryProperty(int prop, ByteReader *buf)
 static bool ValidateIndustryLayout(const IndustryTileLayout &layout)
 {
 	const size_t size = layout.size();
+	if (size == 0) return false;
+
 	for (size_t i = 0; i < size - 1; i++) {
 		for (size_t j = i + 1; j < size; j++) {
 			if (layout[i].ti.x == layout[j].ti.x &&
@@ -3366,7 +3421,16 @@ static bool ValidateIndustryLayout(const IndustryTileLayout &layout)
 			}
 		}
 	}
-	return true;
+
+	bool have_regular_tile = false;
+	for (size_t i = 0; i < size; i++) {
+		if (layout[i].gfx != GFX_WATERTILE_SPECIALCHECK) {
+			have_regular_tile = true;
+			break;
+		}
+	}
+
+	return have_regular_tile;
 }
 
 /**
@@ -3517,7 +3581,7 @@ static ChangeInfoResult IndustriesChangeInfo(uint indid, int numinfo, int prop, 
 								/* Declared as been valid, can be used */
 								it.gfx = tempid;
 							}
-						} else if (it.gfx == 0xFF) {
+						} else if (it.gfx == GFX_WATERTILE_SPECIALCHECK) {
 							it.ti.x = (int8)GB(it.ti.x, 0, 8);
 							it.ti.y = (int8)GB(it.ti.y, 0, 8);
 
@@ -4043,7 +4107,7 @@ static ChangeInfoResult ObjectChangeInfo(uint id, int numinfo, int prop, ByteRea
 				if (*ospec == nullptr) {
 					*ospec = CallocT<ObjectSpec>(1);
 					(*ospec)->views = 1; // Default for NewGRFs that don't set it.
-					(*ospec)->size = 0x11; // Default for NewGRFs that manage to not set it (1x1)
+					(*ospec)->size = OBJECT_SIZE_1X1; // Default for NewGRFs that manage to not set it (1x1)
 				}
 
 				/* Swap classid because we read it in BE. */
@@ -4069,9 +4133,9 @@ static ChangeInfoResult ObjectChangeInfo(uint id, int numinfo, int prop, ByteRea
 
 			case 0x0C: // Size
 				spec->size = buf->ReadByte();
-				if ((spec->size & 0xF0) == 0 || (spec->size & 0x0F) == 0) {
-					grfmsg(1, "ObjectChangeInfo: Invalid object size requested (%u) for object id %u. Ignoring.", spec->size, id + i);
-					spec->size = 0x11; // 1x1
+				if (GB(spec->size, 0, 4) == 0 || GB(spec->size, 4, 4) == 0) {
+					grfmsg(0, "ObjectChangeInfo: Invalid object size requested (0x%x) for object id %u. Ignoring.", spec->size, id + i);
+					spec->size = OBJECT_SIZE_1X1;
 				}
 				break;
 
@@ -4732,6 +4796,7 @@ static void FeatureChangeInfo(ByteReader *buf)
 		/* GSF_ROADTYPES */     RoadTypeChangeInfo,
 		/* GSF_TRAMTYPES */     TramTypeChangeInfo,
 	};
+	static_assert(GSF_END == lengthof(handler));
 
 	uint8 feature  = buf->ReadByte();
 	uint8 numprops = buf->ReadByte();
@@ -4746,7 +4811,7 @@ static void FeatureChangeInfo(ByteReader *buf)
 	grfmsg(6, "FeatureChangeInfo: Feature 0x%02X, %d properties, to apply to %d+%d",
 	               feature, numprops, engine, numinfo);
 
-	if (feature >= lengthof(handler) || handler[feature] == nullptr) {
+	if (handler[feature] == nullptr) {
 		if (feature != GSF_CARGOES) grfmsg(1, "FeatureChangeInfo: Unsupported feature 0x%02X, skipping", feature);
 		return;
 	}
@@ -4884,7 +4949,7 @@ static void NewSpriteSet(ByteReader *buf)
 
 	for (int i = 0; i < num_sets * num_ents; i++) {
 		_cur.nfo_line++;
-		LoadNextSprite(_cur.spriteid++, _cur.file_index, _cur.nfo_line, _cur.grf_container_ver);
+		LoadNextSprite(_cur.spriteid++, *_cur.file, _cur.nfo_line);
 	}
 }
 
@@ -4967,7 +5032,7 @@ static void NewSpriteGroup(ByteReader *buf)
 	 *                 otherwise it specifies a number of entries, the exact
 	 *                 meaning depends on the feature
 	 * V feature-specific-data (huge mess, don't even look it up --pasky) */
-	SpriteGroup *act_group = nullptr;
+	const SpriteGroup *act_group = nullptr;
 
 	uint8 feature = buf->ReadByte();
 	if (feature >= GSF_END) {
@@ -5148,24 +5213,58 @@ static void NewSpriteGroup(ByteReader *buf)
 						return;
 					}
 
+					grfmsg(6, "NewSpriteGroup: New SpriteGroup 0x%02X, %u loaded, %u loading",
+							setid, num_loaded, num_loading);
+
+					if (num_loaded + num_loading == 0) {
+						grfmsg(1, "NewSpriteGroup: no result, skipping invalid RealSpriteGroup");
+						break;
+					}
+
+					if (num_loaded + num_loading == 1) {
+						/* Avoid creating 'Real' sprite group if only one option. */
+						uint16 spriteid = buf->ReadWord();
+						act_group = CreateGroupFromGroupID(feature, setid, type, spriteid);
+						grfmsg(8, "NewSpriteGroup: one result, skipping RealSpriteGroup = subset %u", spriteid);
+						break;
+					}
+
+					std::vector<uint16> loaded;
+					std::vector<uint16> loading;
+
+					for (uint i = 0; i < num_loaded; i++) {
+						loaded.push_back(buf->ReadWord());
+						grfmsg(8, "NewSpriteGroup: + rg->loaded[%i]  = subset %u", i, loaded[i]);
+					}
+
+					for (uint i = 0; i < num_loading; i++) {
+						loading.push_back(buf->ReadWord());
+						grfmsg(8, "NewSpriteGroup: + rg->loading[%i] = subset %u", i, loading[i]);
+					}
+
+					if (std::adjacent_find(loaded.begin(),  loaded.end(),  std::not_equal_to<>()) == loaded.end() &&
+						std::adjacent_find(loading.begin(), loading.end(), std::not_equal_to<>()) == loading.end() &&
+						loaded[0] == loading[0])
+					{
+						/* Both lists only contain the same value, so don't create 'Real' sprite group */
+						act_group = CreateGroupFromGroupID(feature, setid, type, loaded[0]);
+						grfmsg(8, "NewSpriteGroup: same result, skipping RealSpriteGroup = subset %u", loaded[0]);
+						break;
+					}
+
 					assert(RealSpriteGroup::CanAllocateItem());
 					RealSpriteGroup *group = new RealSpriteGroup();
 					group->nfo_line = _cur.nfo_line;
 					act_group = group;
 
-					grfmsg(6, "NewSpriteGroup: New SpriteGroup 0x%02X, %u loaded, %u loading",
-							setid, num_loaded, num_loading);
-
-					for (uint i = 0; i < num_loaded; i++) {
-						uint16 spriteid = buf->ReadWord();
-						group->loaded.push_back(CreateGroupFromGroupID(feature, setid, type, spriteid));
-						grfmsg(8, "NewSpriteGroup: + rg->loaded[%i]  = subset %u", i, spriteid);
+					for (uint16 spriteid : loaded) {
+						const SpriteGroup *t = CreateGroupFromGroupID(feature, setid, type, spriteid);
+						group->loaded.push_back(t);
 					}
 
-					for (uint i = 0; i < num_loading; i++) {
-						uint16 spriteid = buf->ReadWord();
-						group->loading.push_back(CreateGroupFromGroupID(feature, setid, type, spriteid));
-						grfmsg(8, "NewSpriteGroup: + rg->loading[%i] = subset %u", i, spriteid);
+					for (uint16 spriteid : loading) {
+						const SpriteGroup *t = CreateGroupFromGroupID(feature, setid, type, spriteid);
+						group->loading.push_back(t);
 					}
 
 					break;
@@ -6095,7 +6194,7 @@ static const Action5Type _action5_types[] = {
 	/* 0x11 */ { A5BLOCK_ALLOW_OFFSET, SPR_ROADSTOP_BASE,            1, ROADSTOP_SPRITE_COUNT,                       "Road stop graphics"       },
 	/* 0x12 */ { A5BLOCK_ALLOW_OFFSET, SPR_AQUEDUCT_BASE,            1, AQUEDUCT_SPRITE_COUNT,                       "Aqueduct graphics"        },
 	/* 0x13 */ { A5BLOCK_ALLOW_OFFSET, SPR_AUTORAIL_BASE,            1, AUTORAIL_SPRITE_COUNT,                       "Autorail graphics"        },
-	/* 0x14 */ { A5BLOCK_ALLOW_OFFSET, SPR_FLAGS_BASE,               1, FLAGS_SPRITE_COUNT,                          "Flag graphics"            },
+	/* 0x14 */ { A5BLOCK_INVALID,      0,                            1, 0,                                           "Flag graphics"            }, // deprecated, no longer used.
 	/* 0x15 */ { A5BLOCK_ALLOW_OFFSET, SPR_OPENTTD_BASE,             1, OPENTTD_SPRITE_COUNT,                        "OpenTTD GUI graphics"     },
 	/* 0x16 */ { A5BLOCK_ALLOW_OFFSET, SPR_AIRPORT_PREVIEW_BASE,     1, SPR_AIRPORT_PREVIEW_COUNT,                   "Airport preview graphics" },
 	/* 0x17 */ { A5BLOCK_ALLOW_OFFSET, SPR_RAILTYPE_TUNNEL_BASE,     1, RAILTYPE_TUNNEL_BASE_COUNT,                  "Railtype tunnel base"     },
@@ -6120,16 +6219,16 @@ static void GraphicsNew(ByteReader *buf)
 		/* Special not-TTDP-compatible case used in openttd.grf
 		 * Missing shore sprites and initialisation of SPR_SHORE_BASE */
 		grfmsg(2, "GraphicsNew: Loading 10 missing shore sprites from extra grf.");
-		LoadNextSprite(SPR_SHORE_BASE +  0, _cur.file_index, _cur.nfo_line++, _cur.grf_container_ver); // SLOPE_STEEP_S
-		LoadNextSprite(SPR_SHORE_BASE +  5, _cur.file_index, _cur.nfo_line++, _cur.grf_container_ver); // SLOPE_STEEP_W
-		LoadNextSprite(SPR_SHORE_BASE +  7, _cur.file_index, _cur.nfo_line++, _cur.grf_container_ver); // SLOPE_WSE
-		LoadNextSprite(SPR_SHORE_BASE + 10, _cur.file_index, _cur.nfo_line++, _cur.grf_container_ver); // SLOPE_STEEP_N
-		LoadNextSprite(SPR_SHORE_BASE + 11, _cur.file_index, _cur.nfo_line++, _cur.grf_container_ver); // SLOPE_NWS
-		LoadNextSprite(SPR_SHORE_BASE + 13, _cur.file_index, _cur.nfo_line++, _cur.grf_container_ver); // SLOPE_ENW
-		LoadNextSprite(SPR_SHORE_BASE + 14, _cur.file_index, _cur.nfo_line++, _cur.grf_container_ver); // SLOPE_SEN
-		LoadNextSprite(SPR_SHORE_BASE + 15, _cur.file_index, _cur.nfo_line++, _cur.grf_container_ver); // SLOPE_STEEP_E
-		LoadNextSprite(SPR_SHORE_BASE + 16, _cur.file_index, _cur.nfo_line++, _cur.grf_container_ver); // SLOPE_EW
-		LoadNextSprite(SPR_SHORE_BASE + 17, _cur.file_index, _cur.nfo_line++, _cur.grf_container_ver); // SLOPE_NS
+		LoadNextSprite(SPR_SHORE_BASE +  0, *_cur.file, _cur.nfo_line++); // SLOPE_STEEP_S
+		LoadNextSprite(SPR_SHORE_BASE +  5, *_cur.file, _cur.nfo_line++); // SLOPE_STEEP_W
+		LoadNextSprite(SPR_SHORE_BASE +  7, *_cur.file, _cur.nfo_line++); // SLOPE_WSE
+		LoadNextSprite(SPR_SHORE_BASE + 10, *_cur.file, _cur.nfo_line++); // SLOPE_STEEP_N
+		LoadNextSprite(SPR_SHORE_BASE + 11, *_cur.file, _cur.nfo_line++); // SLOPE_NWS
+		LoadNextSprite(SPR_SHORE_BASE + 13, *_cur.file, _cur.nfo_line++); // SLOPE_ENW
+		LoadNextSprite(SPR_SHORE_BASE + 14, *_cur.file, _cur.nfo_line++); // SLOPE_SEN
+		LoadNextSprite(SPR_SHORE_BASE + 15, *_cur.file, _cur.nfo_line++); // SLOPE_STEEP_E
+		LoadNextSprite(SPR_SHORE_BASE + 16, *_cur.file, _cur.nfo_line++); // SLOPE_EW
+		LoadNextSprite(SPR_SHORE_BASE + 17, *_cur.file, _cur.nfo_line++); // SLOPE_NS
 		if (_loaded_newgrf_features.shore == SHORE_REPLACE_NONE) _loaded_newgrf_features.shore = SHORE_REPLACE_ONLY_NEW;
 		return;
 	}
@@ -6175,9 +6274,17 @@ static void GraphicsNew(ByteReader *buf)
 		if (offset <= depot_no_track_offset && offset + num > depot_no_track_offset) _loaded_newgrf_features.tram = TRAMWAY_REPLACE_DEPOT_NO_TRACK;
 	}
 
+	/* If the baseset or grf only provides sprites for flat tiles (pre #10282), duplicate those for use on slopes. */
+	bool dup_oneway_sprites = ((type == 0x09) && (offset + num <= SPR_ONEWAY_SLOPE_N_OFFSET));
+
 	for (; num > 0; num--) {
 		_cur.nfo_line++;
-		LoadNextSprite(replace == 0 ? _cur.spriteid++ : replace++, _cur.file_index, _cur.nfo_line, _cur.grf_container_ver);
+		int load_index = (replace == 0 ? _cur.spriteid++ : replace++);
+		LoadNextSprite(load_index, *_cur.file, _cur.nfo_line);
+		if (dup_oneway_sprites) {
+			DupSprite(load_index, load_index + SPR_ONEWAY_SLOPE_N_OFFSET);
+			DupSprite(load_index, load_index + SPR_ONEWAY_SLOPE_S_OFFSET);
+		}
 	}
 
 	_cur.skip_sprites = skip_num;
@@ -6238,7 +6345,7 @@ bool GetGlobalVariable(byte param, uint32 *value, const GRFFile *grffile)
 			return true;
 
 		case 0x0A: // animation counter
-			*value = _tick_counter;
+			*value = GB(_tick_counter, 0, 16);
 			return true;
 
 		case 0x0B: { // TTDPatch version
@@ -6396,19 +6503,20 @@ static void CfgApply(ByteReader *buf)
 	 *                 to place where parameter is to be stored. */
 
 	/* Preload the next sprite */
-	size_t pos = FioGetPos();
-	uint32 num = _cur.grf_container_ver >= 2 ? FioReadDword() : FioReadWord();
-	uint8 type = FioReadByte();
+	SpriteFile &file = *_cur.file;
+	size_t pos = file.GetPos();
+	uint32 num = file.GetContainerVersion() >= 2 ? file.ReadDword() : file.ReadWord();
+	uint8 type = file.ReadByte();
 	byte *preload_sprite = nullptr;
 
 	/* Check if the sprite is a pseudo sprite. We can't operate on real sprites. */
 	if (type == 0xFF) {
 		preload_sprite = MallocT<byte>(num);
-		FioReadBlock(preload_sprite, num);
+		file.ReadBlock(preload_sprite, num);
 	}
 
 	/* Reset the file position to the start of the next sprite */
-	FioSeekTo(pos, SEEK_SET);
+	file.SeekTo(pos, SEEK_SET);
 
 	if (type != 0xFF) {
 		grfmsg(2, "CfgApply: Ignoring (next sprite is real, unsupported)");
@@ -6639,22 +6747,22 @@ static void SkipIf(ByteReader *buf)
 	 * file. The jump will always be the first matching label that follows
 	 * the current nfo_line. If no matching label is found, the first matching
 	 * label in the file is used. */
-	GRFLabel *choice = nullptr;
-	for (GRFLabel *label = _cur.grffile->label; label != nullptr; label = label->next) {
-		if (label->label != numsprites) continue;
+	const GRFLabel *choice = nullptr;
+	for (const auto &label : _cur.grffile->labels) {
+		if (label.label != numsprites) continue;
 
 		/* Remember a goto before the current line */
-		if (choice == nullptr) choice = label;
+		if (choice == nullptr) choice = &label;
 		/* If we find a label here, this is definitely good */
-		if (label->nfo_line > _cur.nfo_line) {
-			choice = label;
+		if (label.nfo_line > _cur.nfo_line) {
+			choice = &label;
 			break;
 		}
 	}
 
 	if (choice != nullptr) {
 		grfmsg(2, "SkipIf: Jumping to label 0x%0X at line %d, test was true", choice->label, choice->nfo_line);
-		FioSeekTo(choice->pos, SEEK_SET);
+		_cur.file->SeekTo(choice->pos, SEEK_SET);
 		_cur.nfo_line = choice->nfo_line;
 		return;
 	}
@@ -6686,7 +6794,7 @@ static void ScanInfo(ByteReader *buf)
 
 	if (grf_version < 2 || grf_version > 8) {
 		SetBit(_cur.grfconfig->flags, GCF_INVALID);
-		DEBUG(grf, 0, "%s: NewGRF \"%s\" (GRFID %08X) uses GRF version %d, which is incompatible with this version of OpenTTD.", _cur.grfconfig->filename, name, BSWAP32(grfid), grf_version);
+		Debug(grf, 0, "{}: NewGRF \"{}\" (GRFID {:08X}) uses GRF version {}, which is incompatible with this version of OpenTTD.", _cur.grfconfig->filename, name, BSWAP32(grfid), grf_version);
 	}
 
 	/* GRF IDs starting with 0xFF are reserved for internal TTDPatch use */
@@ -6723,7 +6831,7 @@ static void GRFInfo(ByteReader *buf)
 	}
 
 	if (_cur.grffile->grfid != grfid) {
-		DEBUG(grf, 0, "GRFInfo: GRFID %08X in FILESCAN stage does not match GRFID %08X in INIT/RESERVE/ACTIVATION stage", BSWAP32(_cur.grffile->grfid), BSWAP32(grfid));
+		Debug(grf, 0, "GRFInfo: GRFID {:08X} in FILESCAN stage does not match GRFID {:08X} in INIT/RESERVE/ACTIVATION stage", BSWAP32(_cur.grffile->grfid), BSWAP32(grfid));
 		_cur.grffile->grfid = grfid;
 	}
 
@@ -6731,7 +6839,7 @@ static void GRFInfo(ByteReader *buf)
 	_cur.grfconfig->status = _cur.stage < GLS_RESERVE ? GCS_INITIALISED : GCS_ACTIVATED;
 
 	/* Do swap the GRFID for displaying purposes since people expect that */
-	DEBUG(grf, 1, "GRFInfo: Loaded GRFv%d set %08X - %s (palette: %s, version: %i)", version, BSWAP32(grfid), name, (_cur.grfconfig->palette & GRFP_USE_MASK) ? "Windows" : "DOS", _cur.grfconfig->version);
+	Debug(grf, 1, "GRFInfo: Loaded GRFv{} set {:08X} - {} (palette: {}, version: {})", version, BSWAP32(grfid), name, (_cur.grfconfig->palette & GRFP_USE_MASK) ? "Windows" : "DOS", _cur.grfconfig->version);
 }
 
 /* Action 0x0A */
@@ -6758,7 +6866,7 @@ static void SpriteReplace(ByteReader *buf)
 		for (uint j = 0; j < num_sprites; j++) {
 			int load_index = first_sprite + j;
 			_cur.nfo_line++;
-			LoadNextSprite(load_index, _cur.file_index, _cur.nfo_line, _cur.grf_container_ver); // XXX
+			LoadNextSprite(load_index, *_cur.file, _cur.nfo_line); // XXX
 
 			/* Shore sprites now located at different addresses.
 			 * So detect when the old ones get replaced. */
@@ -6993,6 +7101,10 @@ static uint32 GetPatchVariable(uint8 param)
 		/* Shore base sprite */
 		case 0x16:
 			return SPR_SHORE_BASE;
+
+		/* Game map seed */
+		case 0x17:
+			return _settings_game.game_creation.generation_seed;
 
 		default:
 			grfmsg(2, "ParamSet: Unknown Patch variable 0x%02X.", param);
@@ -7393,7 +7505,7 @@ static void GRFInhibit(ByteReader *buf)
 		if (file != nullptr && file != _cur.grfconfig) {
 			grfmsg(2, "GRFInhibit: Deactivating file '%s'", file->filename);
 			GRFError *error = DisableGrf(STR_NEWGRF_ERROR_FORCEFULLY_DISABLED, file);
-			error->data = stredup(_cur.grfconfig->GetName());
+			error->data = _cur.grfconfig->GetName();
 		}
 	}
 }
@@ -7491,23 +7603,9 @@ static void DefineGotoLabel(ByteReader *buf)
 
 	byte nfo_label = buf->ReadByte();
 
-	GRFLabel *label = MallocT<GRFLabel>(1);
-	label->label    = nfo_label;
-	label->nfo_line = _cur.nfo_line;
-	label->pos      = FioGetPos();
-	label->next     = nullptr;
+	_cur.grffile->labels.emplace_back(nfo_label, _cur.nfo_line, _cur.file->GetPos());
 
-	/* Set up a linked list of goto targets which we will search in an Action 0x7/0x9 */
-	if (_cur.grffile->label == nullptr) {
-		_cur.grffile->label = label;
-	} else {
-		/* Attach the label to the end of the list */
-		GRFLabel *l;
-		for (l = _cur.grffile->label; l->next != nullptr; l = l->next) {}
-		l->next = label;
-	}
-
-	grfmsg(2, "DefineGotoLabel: GOTO target with label 0x%02X", label->label);
+	grfmsg(2, "DefineGotoLabel: GOTO target with label 0x%02X", nfo_label);
 }
 
 /**
@@ -7517,8 +7615,8 @@ static void DefineGotoLabel(ByteReader *buf)
 static void ImportGRFSound(SoundEntry *sound)
 {
 	const GRFFile *file;
-	uint32 grfid = FioReadDword();
-	SoundID sound_id = FioReadWord();
+	uint32 grfid = _cur.file->ReadDword();
+	SoundID sound_id = _cur.file->ReadWord();
 
 	file = GetFileByGRFID(grfid);
 	if (file == nullptr || file->sound_offset == 0) {
@@ -7553,9 +7651,9 @@ static void LoadGRFSound(size_t offs, SoundEntry *sound)
 
 	if (offs != SIZE_MAX) {
 		/* Sound is present in the NewGRF. */
-		sound->file_slot = _cur.file_index;
+		sound->file = _cur.file;
 		sound->file_offset = offs;
-		sound->grf_container_ver = _cur.grf_container_ver;
+		sound->grf_container_ver = _cur.file->GetContainerVersion();
 	}
 }
 
@@ -7578,6 +7676,8 @@ static void GRFSound(ByteReader *buf)
 		sound = GetSound(_cur.grffile->sound_offset);
 	}
 
+	SpriteFile &file = *_cur.file;
+	byte grf_container_version = file.GetContainerVersion();
 	for (int i = 0; i < num; i++) {
 		_cur.nfo_line++;
 
@@ -7585,21 +7685,21 @@ static void GRFSound(ByteReader *buf)
 		 * While this is invalid, we do not check for this. But we should prevent it from causing bigger trouble */
 		bool invalid = i >= _cur.grffile->num_sounds;
 
-		size_t offs = FioGetPos();
+		size_t offs = file.GetPos();
 
-		uint32 len = _cur.grf_container_ver >= 2 ? FioReadDword() : FioReadWord();
-		byte type = FioReadByte();
+		uint32 len = grf_container_version >= 2 ? file.ReadDword() : file.ReadWord();
+		byte type = file.ReadByte();
 
-		if (_cur.grf_container_ver >= 2 && type == 0xFD) {
+		if (grf_container_version >= 2 && type == 0xFD) {
 			/* Reference to sprite section. */
 			if (invalid) {
 				grfmsg(1, "GRFSound: Sound index out of range (multiple Action 11?)");
-				FioSkipBytes(len);
+				file.SkipBytes(len);
 			} else if (len != 4) {
 				grfmsg(1, "GRFSound: Invalid sprite section import");
-				FioSkipBytes(len);
+				file.SkipBytes(len);
 			} else {
-				uint32 id = FioReadDword();
+				uint32 id = file.ReadDword();
 				if (_cur.stage == GLS_INIT) LoadGRFSound(GetGRFSpriteOffset(id), sound + i);
 			}
 			continue;
@@ -7607,44 +7707,44 @@ static void GRFSound(ByteReader *buf)
 
 		if (type != 0xFF) {
 			grfmsg(1, "GRFSound: Unexpected RealSprite found, skipping");
-			FioSkipBytes(7);
-			SkipSpriteData(type, len - 8);
+			file.SkipBytes(7);
+			SkipSpriteData(*_cur.file, type, len - 8);
 			continue;
 		}
 
 		if (invalid) {
 			grfmsg(1, "GRFSound: Sound index out of range (multiple Action 11?)");
-			FioSkipBytes(len);
+			file.SkipBytes(len);
 		}
 
-		byte action = FioReadByte();
+		byte action = file.ReadByte();
 		switch (action) {
 			case 0xFF:
 				/* Allocate sound only in init stage. */
 				if (_cur.stage == GLS_INIT) {
-					if (_cur.grf_container_ver >= 2) {
+					if (grf_container_version >= 2) {
 						grfmsg(1, "GRFSound: Inline sounds are not supported for container version >= 2");
 					} else {
 						LoadGRFSound(offs, sound + i);
 					}
 				}
-				FioSkipBytes(len - 1); // already read <action>
+				file.SkipBytes(len - 1); // already read <action>
 				break;
 
 			case 0xFE:
 				if (_cur.stage == GLS_ACTIVATION) {
 					/* XXX 'Action 0xFE' isn't really specified. It is only mentioned for
 					 * importing sounds, so this is probably all wrong... */
-					if (FioReadByte() != 0) grfmsg(1, "GRFSound: Import type mismatch");
+					if (file.ReadByte() != 0) grfmsg(1, "GRFSound: Import type mismatch");
 					ImportGRFSound(sound + i);
 				} else {
-					FioSkipBytes(len - 1); // already read <action>
+					file.SkipBytes(len - 1); // already read <action>
 				}
 				break;
 
 			default:
 				grfmsg(1, "GRFSound: Unexpected Action %x found, skipping", action);
-				FioSkipBytes(len - 1); // already read <action>
+				file.SkipBytes(len - 1); // already read <action>
 				break;
 		}
 	}
@@ -7688,7 +7788,7 @@ static void LoadFontGlyph(ByteReader *buf)
 		for (uint c = 0; c < num_char; c++) {
 			if (size < FS_END) SetUnicodeGlyph(size, base_char + c, _cur.spriteid);
 			_cur.nfo_line++;
-			LoadNextSprite(_cur.spriteid++, _cur.file_index, _cur.nfo_line, _cur.grf_container_ver);
+			LoadNextSprite(_cur.spriteid++, *_cur.file, _cur.nfo_line);
 		}
 	}
 }
@@ -7741,9 +7841,7 @@ static void TranslateGRFStrings(ByteReader *buf)
 		 * and disable this file. */
 		GRFError *error = DisableGrf(STR_NEWGRF_ERROR_LOAD_AFTER);
 
-		char tmp[256];
-		GetString(tmp, STR_NEWGRF_ERROR_AFTER_TRANSLATED_FILE, lastof(tmp));
-		error->data = tmp;
+		error->data = GetString(STR_NEWGRF_ERROR_AFTER_TRANSLATED_FILE);
 
 		return;
 	}
@@ -8285,89 +8383,89 @@ static void GRFUnsafe(ByteReader *buf)
 /** Initialize the TTDPatch flags */
 static void InitializeGRFSpecial()
 {
-	_ttdpatch_flags[0] = ((_settings_game.station.never_expire_airports ? 1 : 0) << 0x0C)  // keepsmallairport
-	                   |                                                      (1 << 0x0D)  // newairports
-	                   |                                                      (1 << 0x0E)  // largestations
-	                   | ((_settings_game.construction.max_bridge_length > 16 ? 1 : 0) << 0x0F)  // longbridges
-	                   |                                                      (0 << 0x10)  // loadtime
-	                   |                                                      (1 << 0x12)  // presignals
-	                   |                                                      (1 << 0x13)  // extpresignals
-	                   | ((_settings_game.vehicle.never_expire_vehicles ? 1 : 0) << 0x16)  // enginespersist
-	                   |                                                      (1 << 0x1B)  // multihead
-	                   |                                                      (1 << 0x1D)  // lowmemory
-	                   |                                                      (1 << 0x1E); // generalfixes
+	_ttdpatch_flags[0] = ((_settings_game.station.never_expire_airports ? 1U : 0U) << 0x0C)  // keepsmallairport
+	                   |                                                       (1U << 0x0D)  // newairports
+	                   |                                                       (1U << 0x0E)  // largestations
+	                   | ((_settings_game.construction.max_bridge_length > 16 ? 1U : 0U) << 0x0F)  // longbridges
+	                   |                                                       (0U << 0x10)  // loadtime
+	                   |                                                       (1U << 0x12)  // presignals
+	                   |                                                       (1U << 0x13)  // extpresignals
+	                   | ((_settings_game.vehicle.never_expire_vehicles ? 1U : 0U) << 0x16)  // enginespersist
+	                   |                                                       (1U << 0x1B)  // multihead
+	                   |                                                       (1U << 0x1D)  // lowmemory
+	                   |                                                       (1U << 0x1E); // generalfixes
 
-	_ttdpatch_flags[1] =   ((_settings_game.economy.station_noise_level ? 1 : 0) << 0x07)  // moreairports - based on units of noise
-	                   |                                                      (1 << 0x08)  // mammothtrains
-	                   |                                                      (1 << 0x09)  // trainrefit
-	                   |                                                      (0 << 0x0B)  // subsidiaries
-	                   |         ((_settings_game.order.gradual_loading ? 1 : 0) << 0x0C)  // gradualloading
-	                   |                                                      (1 << 0x12)  // unifiedmaglevmode - set bit 0 mode. Not revelant to OTTD
-	                   |                                                      (1 << 0x13)  // unifiedmaglevmode - set bit 1 mode
-	                   |                                                      (1 << 0x14)  // bridgespeedlimits
-	                   |                                                      (1 << 0x16)  // eternalgame
-	                   |                                                      (1 << 0x17)  // newtrains
-	                   |                                                      (1 << 0x18)  // newrvs
-	                   |                                                      (1 << 0x19)  // newships
-	                   |                                                      (1 << 0x1A)  // newplanes
-	                   | ((_settings_game.construction.train_signal_side == 1 ? 1 : 0) << 0x1B)  // signalsontrafficside
-	                   |       ((_settings_game.vehicle.disable_elrails ? 0 : 1) << 0x1C); // electrifiedrailway
+	_ttdpatch_flags[1] =   ((_settings_game.economy.station_noise_level ? 1U : 0U) << 0x07)  // moreairports - based on units of noise
+	                   |                                                       (1U << 0x08)  // mammothtrains
+	                   |                                                       (1U << 0x09)  // trainrefit
+	                   |                                                       (0U << 0x0B)  // subsidiaries
+	                   |         ((_settings_game.order.gradual_loading ? 1U : 0U) << 0x0C)  // gradualloading
+	                   |                                                       (1U << 0x12)  // unifiedmaglevmode - set bit 0 mode. Not revelant to OTTD
+	                   |                                                       (1U << 0x13)  // unifiedmaglevmode - set bit 1 mode
+	                   |                                                       (1U << 0x14)  // bridgespeedlimits
+	                   |                                                       (1U << 0x16)  // eternalgame
+	                   |                                                       (1U << 0x17)  // newtrains
+	                   |                                                       (1U << 0x18)  // newrvs
+	                   |                                                       (1U << 0x19)  // newships
+	                   |                                                       (1U << 0x1A)  // newplanes
+	                   | ((_settings_game.construction.train_signal_side == 1 ? 1U : 0U) << 0x1B)  // signalsontrafficside
+	                   |       ((_settings_game.vehicle.disable_elrails ? 0U : 1U) << 0x1C); // electrifiedrailway
 
-	_ttdpatch_flags[2] =                                                      (1 << 0x01)  // loadallgraphics - obsolote
-	                   |                                                      (1 << 0x03)  // semaphores
-	                   |                                                      (1 << 0x0A)  // newobjects
-	                   |                                                      (0 << 0x0B)  // enhancedgui
-	                   |                                                      (0 << 0x0C)  // newagerating
-	                   |  ((_settings_game.construction.build_on_slopes ? 1 : 0) << 0x0D)  // buildonslopes
-	                   |                                                      (1 << 0x0E)  // fullloadany
-	                   |                                                      (1 << 0x0F)  // planespeed
-	                   |                                                      (0 << 0x10)  // moreindustriesperclimate - obsolete
-	                   |                                                      (0 << 0x11)  // moretoylandfeatures
-	                   |                                                      (1 << 0x12)  // newstations
-	                   |                                                      (1 << 0x13)  // tracktypecostdiff
-	                   |                                                      (1 << 0x14)  // manualconvert
-	                   |  ((_settings_game.construction.build_on_slopes ? 1 : 0) << 0x15)  // buildoncoasts
-	                   |                                                      (1 << 0x16)  // canals
-	                   |                                                      (1 << 0x17)  // newstartyear
-	                   |    ((_settings_game.vehicle.freight_trains > 1 ? 1 : 0) << 0x18)  // freighttrains
-	                   |                                                      (1 << 0x19)  // newhouses
-	                   |                                                      (1 << 0x1A)  // newbridges
-	                   |                                                      (1 << 0x1B)  // newtownnames
-	                   |                                                      (1 << 0x1C)  // moreanimation
-	                   |    ((_settings_game.vehicle.wagon_speed_limits ? 1 : 0) << 0x1D)  // wagonspeedlimits
-	                   |                                                      (1 << 0x1E)  // newshistory
-	                   |                                                      (0 << 0x1F); // custombridgeheads
+	_ttdpatch_flags[2] =                                                       (1U << 0x01)  // loadallgraphics - obsolote
+	                   |                                                       (1U << 0x03)  // semaphores
+	                   |                                                       (1U << 0x0A)  // newobjects
+	                   |                                                       (0U << 0x0B)  // enhancedgui
+	                   |                                                       (0U << 0x0C)  // newagerating
+	                   |  ((_settings_game.construction.build_on_slopes ? 1U : 0U) << 0x0D)  // buildonslopes
+	                   |                                                       (1U << 0x0E)  // fullloadany
+	                   |                                                       (1U << 0x0F)  // planespeed
+	                   |                                                       (0U << 0x10)  // moreindustriesperclimate - obsolete
+	                   |                                                       (0U << 0x11)  // moretoylandfeatures
+	                   |                                                       (1U << 0x12)  // newstations
+	                   |                                                       (1U << 0x13)  // tracktypecostdiff
+	                   |                                                       (1U << 0x14)  // manualconvert
+	                   |  ((_settings_game.construction.build_on_slopes ? 1U : 0U) << 0x15)  // buildoncoasts
+	                   |                                                       (1U << 0x16)  // canals
+	                   |                                                       (1U << 0x17)  // newstartyear
+	                   |    ((_settings_game.vehicle.freight_trains > 1 ? 1U : 0U) << 0x18)  // freighttrains
+	                   |                                                       (1U << 0x19)  // newhouses
+	                   |                                                       (1U << 0x1A)  // newbridges
+	                   |                                                       (1U << 0x1B)  // newtownnames
+	                   |                                                       (1U << 0x1C)  // moreanimation
+	                   |    ((_settings_game.vehicle.wagon_speed_limits ? 1U : 0U) << 0x1D)  // wagonspeedlimits
+	                   |                                                       (1U << 0x1E)  // newshistory
+	                   |                                                       (0U << 0x1F); // custombridgeheads
 
-	_ttdpatch_flags[3] =                                                      (0 << 0x00)  // newcargodistribution
-	                   |                                                      (1 << 0x01)  // windowsnap
-	                   | ((_settings_game.economy.allow_town_roads || _generating_world ? 0 : 1) << 0x02)  // townbuildnoroad
-	                   |                                                      (1 << 0x03)  // pathbasedsignalling
-	                   |                                                      (0 << 0x04)  // aichoosechance
-	                   |                                                      (1 << 0x05)  // resolutionwidth
-	                   |                                                      (1 << 0x06)  // resolutionheight
-	                   |                                                      (1 << 0x07)  // newindustries
-	                   |           ((_settings_game.order.improved_load ? 1 : 0) << 0x08)  // fifoloading
-	                   |                                                      (0 << 0x09)  // townroadbranchprob
-	                   |                                                      (0 << 0x0A)  // tempsnowline
-	                   |                                                      (1 << 0x0B)  // newcargo
-	                   |                                                      (1 << 0x0C)  // enhancemultiplayer
-	                   |                                                      (1 << 0x0D)  // onewayroads
-	                   |                                                      (1 << 0x0E)  // irregularstations
-	                   |                                                      (1 << 0x0F)  // statistics
-	                   |                                                      (1 << 0x10)  // newsounds
-	                   |                                                      (1 << 0x11)  // autoreplace
-	                   |                                                      (1 << 0x12)  // autoslope
-	                   |                                                      (0 << 0x13)  // followvehicle
-	                   |                                                      (1 << 0x14)  // trams
-	                   |                                                      (0 << 0x15)  // enhancetunnels
-	                   |                                                      (1 << 0x16)  // shortrvs
-	                   |                                                      (1 << 0x17)  // articulatedrvs
-	                   |       ((_settings_game.vehicle.dynamic_engines ? 1 : 0) << 0x18)  // dynamic engines
-	                   |                                                      (1 << 0x1E)  // variablerunningcosts
-	                   |                                                      (1 << 0x1F); // any switch is on
+	_ttdpatch_flags[3] =                                                       (0U << 0x00)  // newcargodistribution
+	                   |                                                       (1U << 0x01)  // windowsnap
+	                   | ((_settings_game.economy.allow_town_roads || _generating_world ? 0U : 1U) << 0x02)  // townbuildnoroad
+	                   |                                                       (1U << 0x03)  // pathbasedsignalling
+	                   |                                                       (0U << 0x04)  // aichoosechance
+	                   |                                                       (1U << 0x05)  // resolutionwidth
+	                   |                                                       (1U << 0x06)  // resolutionheight
+	                   |                                                       (1U << 0x07)  // newindustries
+	                   |           ((_settings_game.order.improved_load ? 1U : 0U) << 0x08)  // fifoloading
+	                   |                                                       (0U << 0x09)  // townroadbranchprob
+	                   |                                                       (0U << 0x0A)  // tempsnowline
+	                   |                                                       (1U << 0x0B)  // newcargo
+	                   |                                                       (1U << 0x0C)  // enhancemultiplayer
+	                   |                                                       (1U << 0x0D)  // onewayroads
+	                   |                                                       (1U << 0x0E)  // irregularstations
+	                   |                                                       (1U << 0x0F)  // statistics
+	                   |                                                       (1U << 0x10)  // newsounds
+	                   |                                                       (1U << 0x11)  // autoreplace
+	                   |                                                       (1U << 0x12)  // autoslope
+	                   |                                                       (0U << 0x13)  // followvehicle
+	                   |                                                       (1U << 0x14)  // trams
+	                   |                                                       (0U << 0x15)  // enhancetunnels
+	                   |                                                       (1U << 0x16)  // shortrvs
+	                   |                                                       (1U << 0x17)  // articulatedrvs
+	                   |       ((_settings_game.vehicle.dynamic_engines ? 1U : 0U) << 0x18)  // dynamic engines
+	                   |                                                       (1U << 0x1E)  // variablerunningcosts
+	                   |                                                       (1U << 0x1F); // any switch is on
 
-	_ttdpatch_flags[4] =                                                      (1 << 0x00)  // larger persistent storage
-	                   |             ((_settings_game.economy.inflation ? 1 : 0) << 0x01); // inflation is on
+	_ttdpatch_flags[4] =                                                       (1U << 0x00)  // larger persistent storage
+	                   |             ((_settings_game.economy.inflation ? 1U : 0U) << 0x01); // inflation is on
 }
 
 /** Reset and clear all NewGRF stations */
@@ -8708,58 +8806,115 @@ GRFFile::~GRFFile()
 
 
 /**
- * List of what cargo labels are refittable for the given the vehicle-type.
- * Only currently active labels are applied.
- */
-static const CargoLabel _default_refitmasks_rail[] = {
-	'PASS', 'COAL', 'MAIL', 'LVST', 'GOOD', 'GRAI', 'WHEA', 'MAIZ', 'WOOD',
-	'IORE', 'STEL', 'VALU', 'GOLD', 'DIAM', 'PAPR', 'FOOD', 'FRUT', 'CORE',
-	'WATR', 'SUGR', 'TOYS', 'BATT', 'SWET', 'TOFF', 'COLA', 'CTCD', 'BUBL',
-	'PLST', 'FZDR',
-	0 };
-
-static const CargoLabel _default_refitmasks_road[] = {
-	0 };
-
-static const CargoLabel _default_refitmasks_ships[] = {
-	'COAL', 'MAIL', 'LVST', 'GOOD', 'GRAI', 'WHEA', 'MAIZ', 'WOOD', 'IORE',
-	'STEL', 'VALU', 'GOLD', 'DIAM', 'PAPR', 'FOOD', 'FRUT', 'CORE', 'WATR',
-	'RUBR', 'SUGR', 'TOYS', 'BATT', 'SWET', 'TOFF', 'COLA', 'CTCD', 'BUBL',
-	'PLST', 'FZDR',
-	0 };
-
-static const CargoLabel _default_refitmasks_aircraft[] = {
-	'PASS', 'MAIL', 'GOOD', 'VALU', 'GOLD', 'DIAM', 'FOOD', 'FRUT', 'SUGR',
-	'TOYS', 'BATT', 'SWET', 'TOFF', 'COLA', 'CTCD', 'BUBL', 'PLST', 'FZDR',
-	0 };
-
-static const CargoLabel * const _default_refitmasks[] = {
-	_default_refitmasks_rail,
-	_default_refitmasks_road,
-	_default_refitmasks_ships,
-	_default_refitmasks_aircraft,
-};
-
-
-/**
  * Precalculate refit masks from cargo classes for all vehicles.
  */
 static void CalculateRefitMasks()
 {
+	CargoTypes original_known_cargoes = 0;
+	for (int ct = 0; ct != NUM_ORIGINAL_CARGO; ++ct) {
+		CargoID cid = GetDefaultCargoID(_settings_game.game_creation.landscape, static_cast<CargoType>(ct));
+		if (cid != CT_INVALID) SetBit(original_known_cargoes, cid);
+	}
+
 	for (Engine *e : Engine::Iterate()) {
 		EngineID engine = e->index;
 		EngineInfo *ei = &e->info;
 		bool only_defaultcargo; ///< Set if the vehicle shall carry only the default cargo
 
-		/* Did the newgrf specify any refitting? If not, use defaults. */
-		if (_gted[engine].refittability != GRFTempEngineData::UNSET) {
+		/* If the NewGRF did not set any cargo properties, we apply default values. */
+		if (_gted[engine].defaultcargo_grf == nullptr) {
+			/* If the vehicle has any capacity, apply the default refit masks */
+			if (e->type != VEH_TRAIN || e->u.rail.capacity != 0) {
+				static constexpr byte T = 1 << LT_TEMPERATE;
+				static constexpr byte A = 1 << LT_ARCTIC;
+				static constexpr byte S = 1 << LT_TROPIC;
+				static constexpr byte Y = 1 << LT_TOYLAND;
+				static const struct DefaultRefitMasks {
+					byte climate;
+					CargoType cargo_type;
+					CargoTypes cargo_allowed;
+					CargoTypes cargo_disallowed;
+				} _default_refit_masks[] = {
+					{T | A | S | Y, CT_PASSENGERS, CC_PASSENGERS,               0},
+					{T | A | S    , CT_MAIL,       CC_MAIL,                     0},
+					{T | A | S    , CT_VALUABLES,  CC_ARMOURED,                 CC_LIQUID},
+					{            Y, CT_MAIL,       CC_MAIL | CC_ARMOURED,       CC_LIQUID},
+					{T | A        , CT_COAL,       CC_BULK,                     0},
+					{        S    , CT_COPPER_ORE, CC_BULK,                     0},
+					{            Y, CT_SUGAR,      CC_BULK,                     0},
+					{T | A | S    , CT_OIL,        CC_LIQUID,                   0},
+					{            Y, CT_COLA,       CC_LIQUID,                   0},
+					{T            , CT_GOODS,      CC_PIECE_GOODS | CC_EXPRESS, CC_LIQUID | CC_PASSENGERS},
+					{    A | S    , CT_GOODS,      CC_PIECE_GOODS | CC_EXPRESS, CC_LIQUID | CC_PASSENGERS | CC_REFRIGERATED},
+					{    A | S    , CT_FOOD,       CC_REFRIGERATED,             0},
+					{            Y, CT_CANDY,      CC_PIECE_GOODS | CC_EXPRESS, CC_LIQUID | CC_PASSENGERS},
+				};
+
+				if (e->type == VEH_AIRCRAFT) {
+					/* Aircraft default to "light" cargoes */
+					_gted[engine].cargo_allowed = CC_PASSENGERS | CC_MAIL | CC_ARMOURED | CC_EXPRESS;
+					_gted[engine].cargo_disallowed = CC_LIQUID;
+				} else if (e->type == VEH_SHIP) {
+					switch (ei->cargo_type) {
+						case CT_PASSENGERS:
+							/* Ferries */
+							_gted[engine].cargo_allowed = CC_PASSENGERS;
+							_gted[engine].cargo_disallowed = 0;
+							break;
+						case CT_OIL:
+							/* Tankers */
+							_gted[engine].cargo_allowed = CC_LIQUID;
+							_gted[engine].cargo_disallowed = 0;
+							break;
+						default:
+							/* Cargo ships */
+							if (_settings_game.game_creation.landscape == LT_TOYLAND) {
+								/* No tanker in toyland :( */
+								_gted[engine].cargo_allowed = CC_MAIL | CC_ARMOURED | CC_EXPRESS | CC_BULK | CC_PIECE_GOODS | CC_LIQUID;
+								_gted[engine].cargo_disallowed = CC_PASSENGERS;
+							} else {
+								_gted[engine].cargo_allowed = CC_MAIL | CC_ARMOURED | CC_EXPRESS | CC_BULK | CC_PIECE_GOODS;
+								_gted[engine].cargo_disallowed = CC_LIQUID | CC_PASSENGERS;
+							}
+							break;
+					}
+					e->u.ship.old_refittable = true;
+				} else if (e->type == VEH_TRAIN && e->u.rail.railveh_type != RAILVEH_WAGON) {
+					/* Train engines default to all cargoes, so you can build single-cargo consists with fast engines.
+					 * Trains loading multiple cargoes may start stations accepting unwanted cargoes. */
+					_gted[engine].cargo_allowed = CC_PASSENGERS | CC_MAIL | CC_ARMOURED | CC_EXPRESS | CC_BULK | CC_PIECE_GOODS | CC_LIQUID;
+					_gted[engine].cargo_disallowed = 0;
+				} else {
+					/* Train wagons and road vehicles are classified by their default cargo type */
+					for (const auto &drm : _default_refit_masks) {
+						if (!HasBit(drm.climate, _settings_game.game_creation.landscape)) continue;
+						if (drm.cargo_type != ei->cargo_type) continue;
+
+						_gted[engine].cargo_allowed = drm.cargo_allowed;
+						_gted[engine].cargo_disallowed = drm.cargo_disallowed;
+						break;
+					}
+
+					/* All original cargoes have specialised vehicles, so exclude them */
+					_gted[engine].ctt_exclude_mask = original_known_cargoes;
+				}
+			}
+			_gted[engine].UpdateRefittability(_gted[engine].cargo_allowed != 0);
+
+			/* Translate cargo_type using the original climate-specific cargo table. */
+			ei->cargo_type = GetDefaultCargoID(_settings_game.game_creation.landscape, static_cast<CargoType>(ei->cargo_type));
+			if (ei->cargo_type != CT_INVALID) ClrBit(_gted[engine].ctt_exclude_mask, ei->cargo_type);
+		}
+
+		/* Compute refittability */
+		{
 			CargoTypes mask = 0;
 			CargoTypes not_mask = 0;
 			CargoTypes xor_mask = ei->refit_mask;
 
 			/* If the original masks set by the grf are zero, the vehicle shall only carry the default cargo.
 			 * Note: After applying the translations, the vehicle may end up carrying no defined cargo. It becomes unavailable in that case. */
-			only_defaultcargo = _gted[engine].refittability == GRFTempEngineData::EMPTY;
+			only_defaultcargo = _gted[engine].refittability != GRFTempEngineData::NONEMPTY;
 
 			if (_gted[engine].cargo_allowed != 0) {
 				/* Build up the list of cargo types from the set cargo classes. */
@@ -8774,30 +8929,10 @@ static void CalculateRefitMasks()
 			/* Apply explicit refit includes/excludes. */
 			ei->refit_mask |= _gted[engine].ctt_include_mask;
 			ei->refit_mask &= ~_gted[engine].ctt_exclude_mask;
-		} else {
-			CargoTypes xor_mask = 0;
-
-			/* Don't apply default refit mask to wagons nor engines with no capacity */
-			if (e->type != VEH_TRAIN || (e->u.rail.capacity != 0 && e->u.rail.railveh_type != RAILVEH_WAGON)) {
-				const CargoLabel *cl = _default_refitmasks[e->type];
-				for (uint i = 0;; i++) {
-					if (cl[i] == 0) break;
-
-					CargoID cargo = GetCargoIDByLabel(cl[i]);
-					if (cargo == CT_INVALID) continue;
-
-					SetBit(xor_mask, cargo);
-				}
-			}
-
-			ei->refit_mask = xor_mask & _cargo_mask;
-
-			/* If the mask is zero, the vehicle shall only carry the default cargo */
-			only_defaultcargo = (ei->refit_mask == 0);
 		}
 
 		/* Clear invalid cargoslots (from default vehicles or pre-NewCargo GRFs) */
-		if (!HasBit(_cargo_mask, ei->cargo_type)) ei->cargo_type = CT_INVALID;
+		if (ei->cargo_type != CT_INVALID && !HasBit(_cargo_mask, ei->cargo_type)) ei->cargo_type = CT_INVALID;
 
 		/* Ensure that the vehicle is either not refittable, or that the default cargo is one of the refittable cargoes.
 		 * Note: Vehicles refittable to no cargo are handle differently to vehicle refittable to a single cargo. The latter might have subtypes. */
@@ -8821,8 +8956,7 @@ static void CalculateRefitMasks()
 			if (cargo_map_for_first_refittable != nullptr) {
 				/* Use first refittable cargo from cargo translation table */
 				byte best_local_slot = 0xFF;
-				CargoID cargo_type;
-				FOR_EACH_SET_CARGO_ID(cargo_type, ei->refit_mask) {
+				for (CargoID cargo_type : SetCargoBitIterator(ei->refit_mask)) {
 					byte local_slot = cargo_map_for_first_refittable[cargo_type];
 					if (local_slot < best_local_slot) {
 						best_local_slot = local_slot;
@@ -8869,11 +9003,9 @@ static void FinaliseEngineArray()
 
 		if (!HasBit(e->info.climates, _settings_game.game_creation.landscape)) continue;
 
-		/* When the train does not set property 27 (misc flags), but it
-		 * is overridden by a NewGRF graphically we want to disable the
-		 * flipping possibility. */
-		if (e->type == VEH_TRAIN && !_gted[e->index].prop27_set && e->GetGRF() != nullptr && is_custom_sprite(e->u.rail.image_index)) {
-			ClrBit(e->info.misc_flags, EF_RAIL_FLIPS);
+		/* Set appropriate flags on variant engine */
+		if (e->info.variant_id != INVALID_ENGINE) {
+			Engine::Get(e->info.variant_id)->display_flags |= EngineDisplayFlags::HasVariants | EngineDisplayFlags::IsFolded;
 		}
 
 		/* Skip wagons, there livery is defined via the engine */
@@ -8937,7 +9069,7 @@ static bool IsHouseSpecValid(HouseSpec *hs, const HouseSpec *next1, const HouseS
 				(next2 == nullptr || !next2->enabled || (next2->building_flags & BUILDING_HAS_1_TILE) != 0 ||
 				next3 == nullptr || !next3->enabled || (next3->building_flags & BUILDING_HAS_1_TILE) != 0))) {
 		hs->enabled = false;
-		if (filename != nullptr) DEBUG(grf, 1, "FinaliseHouseArray: %s defines house %d as multitile, but no suitable tiles follow. Disabling house.", filename, hs->grf_prop.local_id);
+		if (filename != nullptr) Debug(grf, 1, "FinaliseHouseArray: {} defines house {} as multitile, but no suitable tiles follow. Disabling house.", filename, hs->grf_prop.local_id);
 		return false;
 	}
 
@@ -8947,7 +9079,7 @@ static bool IsHouseSpecValid(HouseSpec *hs, const HouseSpec *next1, const HouseS
 	if (((hs->building_flags & BUILDING_HAS_2_TILES) != 0 && next1->population != 0) ||
 			((hs->building_flags & BUILDING_HAS_4_TILES) != 0 && (next2->population != 0 || next3->population != 0))) {
 		hs->enabled = false;
-		if (filename != nullptr) DEBUG(grf, 1, "FinaliseHouseArray: %s defines multitile house %d with non-zero population on additional tiles. Disabling house.", filename, hs->grf_prop.local_id);
+		if (filename != nullptr) Debug(grf, 1, "FinaliseHouseArray: {} defines multitile house {} with non-zero population on additional tiles. Disabling house.", filename, hs->grf_prop.local_id);
 		return false;
 	}
 
@@ -8955,14 +9087,14 @@ static bool IsHouseSpecValid(HouseSpec *hs, const HouseSpec *next1, const HouseS
 	 * This check should only be done for NewGRF houses because grf_prop.subst_id is not set for original houses.*/
 	if (filename != nullptr && (hs->building_flags & BUILDING_HAS_1_TILE) != (HouseSpec::Get(hs->grf_prop.subst_id)->building_flags & BUILDING_HAS_1_TILE)) {
 		hs->enabled = false;
-		DEBUG(grf, 1, "FinaliseHouseArray: %s defines house %d with different house size then it's substitute type. Disabling house.", filename, hs->grf_prop.local_id);
+		Debug(grf, 1, "FinaliseHouseArray: {} defines house {} with different house size then it's substitute type. Disabling house.", filename, hs->grf_prop.local_id);
 		return false;
 	}
 
 	/* Make sure that additional parts of multitile houses are not available. */
 	if ((hs->building_flags & BUILDING_HAS_1_TILE) == 0 && (hs->building_availability & HZ_ZONALL) != 0 && (hs->building_availability & HZ_CLIMALL) != 0) {
 		hs->enabled = false;
-		if (filename != nullptr) DEBUG(grf, 1, "FinaliseHouseArray: %s defines house %d without a size but marked it as available. Disabling house.", filename, hs->grf_prop.local_id);
+		if (filename != nullptr) Debug(grf, 1, "FinaliseHouseArray: {} defines house {} without a size but marked it as available. Disabling house.", filename, hs->grf_prop.local_id);
 		return false;
 	}
 
@@ -9234,14 +9366,14 @@ static void DecodeSpecialSprite(byte *buf, uint num, GrfLoadingStage stage)
 	if (it == _grf_line_to_action6_sprite_override.end()) {
 		/* No preloaded sprite to work with; read the
 		 * pseudo sprite content. */
-		FioReadBlock(buf, num);
+		_cur.file->ReadBlock(buf, num);
 	} else {
 		/* Use the preloaded sprite data. */
 		buf = _grf_line_to_action6_sprite_override[location];
 		grfmsg(7, "DecodeSpecialSprite: Using preloaded pseudo sprite data");
 
 		/* Skip the real (original) content of this action. */
-		FioSeekTo(num, SEEK_CUR);
+		_cur.file->SeekTo(num, SEEK_CUR);
 	}
 
 	ByteReader br(buf, buf + num);
@@ -9268,41 +9400,102 @@ static void DecodeSpecialSprite(byte *buf, uint num, GrfLoadingStage stage)
 	}
 }
 
-
-/** Signature of a container version 2 GRF. */
-extern const byte _grf_cont_v2_sig[8] = {'G', 'R', 'F', 0x82, 0x0D, 0x0A, 0x1A, 0x0A};
-
 /**
- * Get the container version of the currently opened GRF file.
- * @return Container version of the GRF file or 0 if the file is corrupt/no GRF file.
+ * Load a particular NewGRF from a SpriteFile.
+ * @param config The configuration of the to be loaded NewGRF.
+ * @param stage  The loading stage of the NewGRF.
+ * @param file   The file to load the GRF data from.
  */
-byte GetGRFContainerVersion()
+static void LoadNewGRFFileFromFile(GRFConfig *config, GrfLoadingStage stage, SpriteFile &file)
 {
-	size_t pos = FioGetPos();
+	_cur.file = &file;
+	_cur.grfconfig = config;
 
-	if (FioReadWord() == 0) {
-		/* Check for GRF container version 2, which is identified by the bytes
-		 * '47 52 46 82 0D 0A 1A 0A' at the start of the file. */
-		for (uint i = 0; i < lengthof(_grf_cont_v2_sig); i++) {
-			if (FioReadByte() != _grf_cont_v2_sig[i]) return 0; // Invalid format
-		}
+	Debug(grf, 2, "LoadNewGRFFile: Reading NewGRF-file '{}'", config->filename);
 
-		return 2;
+	byte grf_container_version = file.GetContainerVersion();
+	if (grf_container_version == 0) {
+		Debug(grf, 7, "LoadNewGRFFile: Custom .grf has invalid format");
+		return;
 	}
 
-	/* Container version 1 has no header, rewind to start. */
-	FioSeekTo(pos, SEEK_SET);
-	return 1;
+	if (stage == GLS_INIT || stage == GLS_ACTIVATION) {
+		/* We need the sprite offsets in the init stage for NewGRF sounds
+		 * and in the activation stage for real sprites. */
+		ReadGRFSpriteOffsets(file);
+	} else {
+		/* Skip sprite section offset if present. */
+		if (grf_container_version >= 2) file.ReadDword();
+	}
+
+	if (grf_container_version >= 2) {
+		/* Read compression value. */
+		byte compression = file.ReadByte();
+		if (compression != 0) {
+			Debug(grf, 7, "LoadNewGRFFile: Unsupported compression format");
+			return;
+		}
+	}
+
+	/* Skip the first sprite; we don't care about how many sprites this
+	 * does contain; newest TTDPatches and George's longvehicles don't
+	 * neither, apparently. */
+	uint32 num = grf_container_version >= 2 ? file.ReadDword() : file.ReadWord();
+	if (num == 4 && file.ReadByte() == 0xFF) {
+		file.ReadDword();
+	} else {
+		Debug(grf, 7, "LoadNewGRFFile: Custom .grf has invalid format");
+		return;
+	}
+
+	_cur.ClearDataForNextFile();
+
+	ReusableBuffer<byte> buf;
+
+	while ((num = (grf_container_version >= 2 ? file.ReadDword() : file.ReadWord())) != 0) {
+		byte type = file.ReadByte();
+		_cur.nfo_line++;
+
+		if (type == 0xFF) {
+			if (_cur.skip_sprites == 0) {
+				DecodeSpecialSprite(buf.Allocate(num), num, stage);
+
+				/* Stop all processing if we are to skip the remaining sprites */
+				if (_cur.skip_sprites == -1) break;
+
+				continue;
+			} else {
+				file.SkipBytes(num);
+			}
+		} else {
+			if (_cur.skip_sprites == 0) {
+				grfmsg(0, "LoadNewGRFFile: Unexpected sprite, disabling");
+				DisableGrf(STR_NEWGRF_ERROR_UNEXPECTED_SPRITE);
+				break;
+			}
+
+			if (grf_container_version >= 2 && type == 0xFD) {
+				/* Reference to data section. Container version >= 2 only. */
+				file.SkipBytes(num);
+			} else {
+				file.SkipBytes(7);
+				SkipSpriteData(file, type, num - 8);
+			}
+		}
+
+		if (_cur.skip_sprites > 0) _cur.skip_sprites--;
+	}
 }
 
 /**
  * Load a particular NewGRF.
  * @param config     The configuration of the to be loaded NewGRF.
- * @param file_index The Fio index of the first NewGRF to load.
  * @param stage      The loading stage of the NewGRF.
  * @param subdir     The sub directory to find the NewGRF in.
+ * @param temporary  The NewGRF/sprite file is to be loaded temporarily and should be closed immediately,
+ *                   contrary to loading the SpriteFile and having it cached by the SpriteCache.
  */
-void LoadNewGRFFile(GRFConfig *config, uint file_index, GrfLoadingStage stage, Subdirectory subdir)
+void LoadNewGRFFile(GRFConfig *config, GrfLoadingStage stage, Subdirectory subdir, bool temporary)
 {
 	const char *filename = config->filename;
 
@@ -9322,92 +9515,12 @@ void LoadNewGRFFile(GRFConfig *config, uint file_index, GrfLoadingStage stage, S
 		if (stage == GLS_ACTIVATION && !HasBit(config->flags, GCF_RESERVED)) return;
 	}
 
-	if (file_index >= MAX_FILE_SLOTS) {
-		DEBUG(grf, 0, "'%s' is not loaded as the maximum number of file slots has been reached", filename);
-		config->status = GCS_DISABLED;
-		config->error  = new GRFError(STR_NEWGRF_ERROR_MSG_FATAL, STR_NEWGRF_ERROR_TOO_MANY_NEWGRFS_LOADED);
-		return;
-	}
-
-	FioOpenFile(file_index, filename, subdir);
-	_cur.file_index = file_index; // XXX
-	_palette_remap_grf[_cur.file_index] = (config->palette & GRFP_USE_MASK);
-
-	_cur.grfconfig = config;
-
-	DEBUG(grf, 2, "LoadNewGRFFile: Reading NewGRF-file '%s'", filename);
-
-	_cur.grf_container_ver = GetGRFContainerVersion();
-	if (_cur.grf_container_ver == 0) {
-		DEBUG(grf, 7, "LoadNewGRFFile: Custom .grf has invalid format");
-		return;
-	}
-
-	if (stage == GLS_INIT || stage == GLS_ACTIVATION) {
-		/* We need the sprite offsets in the init stage for NewGRF sounds
-		 * and in the activation stage for real sprites. */
-		ReadGRFSpriteOffsets(_cur.grf_container_ver);
+	bool needs_palette_remap = config->palette & GRFP_USE_MASK;
+	if (temporary) {
+		SpriteFile temporarySpriteFile(filename, subdir, needs_palette_remap);
+		LoadNewGRFFileFromFile(config, stage, temporarySpriteFile);
 	} else {
-		/* Skip sprite section offset if present. */
-		if (_cur.grf_container_ver >= 2) FioReadDword();
-	}
-
-	if (_cur.grf_container_ver >= 2) {
-		/* Read compression value. */
-		byte compression = FioReadByte();
-		if (compression != 0) {
-			DEBUG(grf, 7, "LoadNewGRFFile: Unsupported compression format");
-			return;
-		}
-	}
-
-	/* Skip the first sprite; we don't care about how many sprites this
-	 * does contain; newest TTDPatches and George's longvehicles don't
-	 * neither, apparently. */
-	uint32 num = _cur.grf_container_ver >= 2 ? FioReadDword() : FioReadWord();
-	if (num == 4 && FioReadByte() == 0xFF) {
-		FioReadDword();
-	} else {
-		DEBUG(grf, 7, "LoadNewGRFFile: Custom .grf has invalid format");
-		return;
-	}
-
-	_cur.ClearDataForNextFile();
-
-	ReusableBuffer<byte> buf;
-
-	while ((num = (_cur.grf_container_ver >= 2 ? FioReadDword() : FioReadWord())) != 0) {
-		byte type = FioReadByte();
-		_cur.nfo_line++;
-
-		if (type == 0xFF) {
-			if (_cur.skip_sprites == 0) {
-				DecodeSpecialSprite(buf.Allocate(num), num, stage);
-
-				/* Stop all processing if we are to skip the remaining sprites */
-				if (_cur.skip_sprites == -1) break;
-
-				continue;
-			} else {
-				FioSkipBytes(num);
-			}
-		} else {
-			if (_cur.skip_sprites == 0) {
-				grfmsg(0, "LoadNewGRFFile: Unexpected sprite, disabling");
-				DisableGrf(STR_NEWGRF_ERROR_UNEXPECTED_SPRITE);
-				break;
-			}
-
-			if (_cur.grf_container_ver >= 2 && type == 0xFD) {
-				/* Reference to data section. Container version >= 2 only. */
-				FioSkipBytes(num);
-			} else {
-				FioSkipBytes(7);
-				SkipSpriteData(type, num - 8);
-			}
-		}
-
-		if (_cur.skip_sprites > 0) _cur.skip_sprites--;
+		LoadNewGRFFileFromFile(config, stage, OpenCachedSpriteFile(filename, subdir, needs_palette_remap));
 	}
 }
 
@@ -9506,7 +9619,7 @@ static void FinalisePriceBaseMultipliers()
 		for (Price p = PR_BEGIN; p < PR_END; p++) {
 			/* No price defined -> nothing to do */
 			if (!HasBit(features, _price_base_specs[p].grf_feature) || source->price_base_multipliers[p] == INVALID_PRICE_MODIFIER) continue;
-			DEBUG(grf, 3, "'%s' overrides price base multiplier %d of '%s'", source->filename, p, dest->filename);
+			Debug(grf, 3, "'{}' overrides price base multiplier {} of '{}'", source->filename, p, dest->filename);
 			dest->price_base_multipliers[p] = source->price_base_multipliers[p];
 		}
 	}
@@ -9524,7 +9637,7 @@ static void FinalisePriceBaseMultipliers()
 		for (Price p = PR_BEGIN; p < PR_END; p++) {
 			/* Already a price defined -> nothing to do */
 			if (!HasBit(features, _price_base_specs[p].grf_feature) || dest->price_base_multipliers[p] != INVALID_PRICE_MODIFIER) continue;
-			DEBUG(grf, 3, "Price base multiplier %d from '%s' propagated to '%s'", p, source->filename, dest->filename);
+			Debug(grf, 3, "Price base multiplier {} from '{}' propagated to '{}'", p, source->filename, dest->filename);
 			dest->price_base_multipliers[p] = source->price_base_multipliers[p];
 		}
 	}
@@ -9542,7 +9655,7 @@ static void FinalisePriceBaseMultipliers()
 		for (Price p = PR_BEGIN; p < PR_END; p++) {
 			if (!HasBit(features, _price_base_specs[p].grf_feature)) continue;
 			if (source->price_base_multipliers[p] != dest->price_base_multipliers[p]) {
-				DEBUG(grf, 3, "Price base multiplier %d from '%s' propagated to '%s'", p, dest->filename, source->filename);
+				Debug(grf, 3, "Price base multiplier {} from '{}' propagated to '{}'", p, dest->filename, source->filename);
 			}
 			source->price_base_multipliers[p] = dest->price_base_multipliers[p];
 		}
@@ -9573,11 +9686,11 @@ static void FinalisePriceBaseMultipliers()
 				if (!HasBit(file->grf_features, _price_base_specs[p].grf_feature)) {
 					/* The grf does not define any objects of the feature,
 					 * so it must be a difficulty setting. Apply it globally */
-					DEBUG(grf, 3, "'%s' sets global price base multiplier %d", file->filename, p);
+					Debug(grf, 3, "'{}' sets global price base multiplier {}", file->filename, p);
 					SetPriceBaseMultiplier(p, price_base_multipliers[p]);
 					price_base_multipliers[p] = 0;
 				} else {
-					DEBUG(grf, 3, "'%s' sets local price base multiplier %d", file->filename, p);
+					Debug(grf, 3, "'{}' sets local price base multiplier {}", file->filename, p);
 				}
 			}
 		}
@@ -9706,10 +9819,9 @@ static void AfterLoadGRFs()
 /**
  * Load all the NewGRFs.
  * @param load_index The offset for the first sprite to add.
- * @param file_index The Fio index of the first NewGRF to load.
  * @param num_baseset Number of NewGRFs at the front of the list to look up in the baseset dir instead of the newgrf dir.
  */
-void LoadNewGRF(uint load_index, uint file_index, uint num_baseset)
+void LoadNewGRF(uint load_index, uint num_baseset)
 {
 	/* In case of networking we need to "sync" the start values
 	 * so all NewGRFs are loaded equally. For this we use the
@@ -9718,7 +9830,7 @@ void LoadNewGRF(uint load_index, uint file_index, uint num_baseset)
 	Date date            = _date;
 	Year year            = _cur_year;
 	DateFract date_fract = _date_fract;
-	uint16 tick_counter  = _tick_counter;
+	uint64 tick_counter  = _tick_counter;
 	byte display_opt     = _display_opt;
 
 	if (_networking) {
@@ -9767,7 +9879,7 @@ void LoadNewGRF(uint load_index, uint file_index, uint num_baseset)
 			}
 		}
 
-		uint slot = file_index;
+		uint num_grfs = 0;
 		uint num_non_static = 0;
 
 		_cur.stage = stage;
@@ -9775,9 +9887,9 @@ void LoadNewGRF(uint load_index, uint file_index, uint num_baseset)
 			if (c->status == GCS_DISABLED || c->status == GCS_NOT_FOUND) continue;
 			if (stage > GLS_INIT && HasBit(c->flags, GCF_INIT_ONLY)) continue;
 
-			Subdirectory subdir = slot < file_index + num_baseset ? BASESET_DIR : NEWGRF_DIR;
+			Subdirectory subdir = num_grfs < num_baseset ? BASESET_DIR : NEWGRF_DIR;
 			if (!FioCheckFileExists(c->filename, subdir)) {
-				DEBUG(grf, 0, "NewGRF file is missing '%s'; disabling", c->filename);
+				Debug(grf, 0, "NewGRF file is missing '{}'; disabling", c->filename);
 				c->status = GCS_NOT_FOUND;
 				continue;
 			}
@@ -9786,14 +9898,17 @@ void LoadNewGRF(uint load_index, uint file_index, uint num_baseset)
 
 			if (!HasBit(c->flags, GCF_STATIC) && !HasBit(c->flags, GCF_SYSTEM)) {
 				if (num_non_static == NETWORK_MAX_GRF_COUNT) {
-					DEBUG(grf, 0, "'%s' is not loaded as the maximum number of non-static GRFs has been reached", c->filename);
+					Debug(grf, 0, "'{}' is not loaded as the maximum number of non-static GRFs has been reached", c->filename);
 					c->status = GCS_DISABLED;
 					c->error  = new GRFError(STR_NEWGRF_ERROR_MSG_FATAL, STR_NEWGRF_ERROR_TOO_MANY_NEWGRFS_LOADED);
 					continue;
 				}
 				num_non_static++;
 			}
-			LoadNewGRFFile(c, slot++, stage, subdir);
+
+			num_grfs++;
+
+			LoadNewGRFFile(c, stage, subdir, false);
 			if (stage == GLS_RESERVE) {
 				SetBit(c->flags, GCF_RESERVED);
 			} else if (stage == GLS_ACTIVATION) {
@@ -9801,7 +9916,7 @@ void LoadNewGRF(uint load_index, uint file_index, uint num_baseset)
 				assert(GetFileByGRFID(c->ident.grfid) == _cur.grffile);
 				ClearTemporaryNewGRFData(_cur.grffile);
 				BuildCargoTranslationMap();
-				DEBUG(sprite, 2, "LoadNewGRF: Currently %i sprites are loaded", _cur.spriteid);
+				Debug(sprite, 2, "LoadNewGRF: Currently {} sprites are loaded", _cur.spriteid);
 			} else if (stage == GLS_INIT && HasBit(c->flags, GCF_INIT_ONLY)) {
 				/* We're not going to activate this, so free whatever data we allocated */
 				ClearTemporaryNewGRFData(_cur.grffile);

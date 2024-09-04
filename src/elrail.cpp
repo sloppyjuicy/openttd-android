@@ -470,8 +470,7 @@ static void DrawRailCatenaryRailway(const TileInfo *ti)
 	}
 
 	/* Drawing of pylons is finished, now draw the wires */
-	Track t;
-	FOR_EACH_SET_TRACK(t, wireconfig[TS_HOME]) {
+	for (Track t : SetTrackBitIterator(wireconfig[TS_HOME])) {
 		SpriteID wire_base = (t == halftile_track) ? wire_halftile : wire_normal;
 		byte PCPconfig = HasBit(PCPstatus, PCPpositions[t][0]) +
 			(HasBit(PCPstatus, PCPpositions[t][1]) << 1);
@@ -486,10 +485,11 @@ static void DrawRailCatenaryRailway(const TileInfo *ti)
 		/*
 		 * The "wire"-sprite position is inside the tile, i.e. 0 <= sss->?_offset < TILE_SIZE.
 		 * Therefore it is safe to use GetSlopePixelZ() for the elevation.
-		 * Also note that the result of GetSlopePixelZ() is very special for bridge-ramps.
+		 * Also note that the result of GetSlopePixelZ() is very special for bridge-ramps, so we round the result up or
+		 * down to the nearest full height change.
 		 */
 		AddSortableSpriteToDraw(wire_base + sss->image_offset, PAL_NONE, ti->x + sss->x_offset, ti->y + sss->y_offset,
-			sss->x_size, sss->y_size, sss->z_size, GetSlopePixelZ(ti->x + sss->x_offset, ti->y + sss->y_offset) + sss->z_offset,
+			sss->x_size, sss->y_size, sss->z_size, (GetSlopePixelZ(ti->x + sss->x_offset, ti->y + sss->y_offset) + 4) / 8 * 8 + sss->z_offset,
 			IsTransparencySet(TO_CATENARY));
 	}
 }
@@ -593,9 +593,9 @@ void DrawRailCatenary(const TileInfo *ti)
 	DrawRailCatenaryRailway(ti);
 }
 
-bool SettingsDisableElrail(int32 p1)
+void SettingsDisableElrail(int32 new_value)
 {
-	bool disable = (p1 != 0);
+	bool disable = (new_value != 0);
 
 	/* we will now walk through all electric train engines and change their railtypes if it is the wrong one*/
 	const RailType old_railtype = disable ? RAILTYPE_ELECTRIC : RAILTYPE_RAIL;
@@ -639,5 +639,4 @@ bool SettingsDisableElrail(int32 p1)
 	 * rails. It may have unintended consequences if that function is ever
 	 * extended, though. */
 	ReinitGuiAfterToggleElrail(disable);
-	return true;
 }

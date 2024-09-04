@@ -64,6 +64,10 @@ const char *VideoDriver_SDL_OpenGL::Start(const StringList &param)
 		return error;
 	}
 
+	this->driver_info += " (";
+	this->driver_info += OpenGLBackend::Get()->GetDriverName();
+	this->driver_info += ")";
+
 	/* Now we have a OpenGL context, force a client-size-changed event,
 	 * so all buffers are allocated correctly. */
 	int w, h;
@@ -146,9 +150,7 @@ bool VideoDriver_SDL_OpenGL::AllocateBackingStore(int w, int h, bool force)
 	SDL_GL_SwapWindow(this->sdl_window);
 	_screen.dst_ptr = this->GetVideoPointer();
 
-	_cur_palette.first_dirty = 0;
-	_cur_palette.count_dirty = 256;
-	this->local_palette = _cur_palette;
+	CopyPalette(this->local_palette, true);
 
 	return res;
 }
@@ -173,7 +175,7 @@ void VideoDriver_SDL_OpenGL::Paint()
 {
 	PerformanceMeasurer framerate(PFE_VIDEO);
 
-	if (_cur_palette.count_dirty != 0) {
+	if (this->local_palette.count_dirty != 0) {
 		Blitter *blitter = BlitterFactory::GetCurrentBlitter();
 
 		/* Always push a changed palette to OpenGL. */
@@ -182,7 +184,7 @@ void VideoDriver_SDL_OpenGL::Paint()
 			blitter->PaletteAnimate(this->local_palette);
 		}
 
-		_cur_palette.count_dirty = 0;
+		this->local_palette.count_dirty = 0;
 	}
 
 	OpenGLBackend::Get()->Paint();

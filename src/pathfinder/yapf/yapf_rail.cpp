@@ -241,7 +241,7 @@ public:
 			pf2.DisableCache(true);
 			FindDepotData result2 = pf2.FindNearestDepotTwoWay(v, t1, td1, t2, td2, max_penalty, reverse_penalty);
 			if (result1.tile != result2.tile || (result1.reverse != result2.reverse)) {
-				DEBUG(desync, 2, "CACHE ERROR: FindNearestDepotTwoWay() = [%s, %s]",
+				Debug(desync, 2, "CACHE ERROR: FindNearestDepotTwoWay() = [{}, {}]",
 						result1.tile != INVALID_TILE ? "T" : "F",
 						result2.tile != INVALID_TILE ? "T" : "F");
 				DumpState(pf1, pf2);
@@ -325,7 +325,7 @@ public:
 			pf2.DisableCache(true);
 			result1 = pf2.FindNearestSafeTile(v, t1, td, override_railtype, false);
 			if (result1 != result2) {
-				DEBUG(desync, 2, "CACHE ERROR: FindSafeTile() = [%s, %s]", result2 ? "T" : "F", result1 ? "T" : "F");
+				Debug(desync, 2, "CACHE ERROR: FindSafeTile() = [{}, {}]", result2 ? "T" : "F", result1 ? "T" : "F");
 				DumpState(pf1, pf2);
 			}
 		}
@@ -395,21 +395,21 @@ public:
 		return 't';
 	}
 
-	static Trackdir stChooseRailTrack(const Train *v, TileIndex tile, DiagDirection enterdir, TrackBits tracks, bool &path_found, bool reserve_track, PBSTileInfo *target)
+	static Trackdir stChooseRailTrack(const Train *v, TileIndex tile, DiagDirection enterdir, TrackBits tracks, bool &path_found, bool reserve_track, PBSTileInfo *target, TileIndex *dest)
 	{
 		/* create pathfinder instance */
 		Tpf pf1;
 		Trackdir result1;
 
 		if (_debug_desync_level < 2) {
-			result1 = pf1.ChooseRailTrack(v, tile, enterdir, tracks, path_found, reserve_track, target);
+			result1 = pf1.ChooseRailTrack(v, tile, enterdir, tracks, path_found, reserve_track, target, dest);
 		} else {
-			result1 = pf1.ChooseRailTrack(v, tile, enterdir, tracks, path_found, false, nullptr);
+			result1 = pf1.ChooseRailTrack(v, tile, enterdir, tracks, path_found, false, nullptr, nullptr);
 			Tpf pf2;
 			pf2.DisableCache(true);
-			Trackdir result2 = pf2.ChooseRailTrack(v, tile, enterdir, tracks, path_found, reserve_track, target);
+			Trackdir result2 = pf2.ChooseRailTrack(v, tile, enterdir, tracks, path_found, reserve_track, target, dest);
 			if (result1 != result2) {
-				DEBUG(desync, 2, "CACHE ERROR: ChooseRailTrack() = [%d, %d]", result1, result2);
+				Debug(desync, 2, "CACHE ERROR: ChooseRailTrack() = [{}, {}]", result1, result2);
 				DumpState(pf1, pf2);
 			}
 		}
@@ -417,9 +417,10 @@ public:
 		return result1;
 	}
 
-	inline Trackdir ChooseRailTrack(const Train *v, TileIndex tile, DiagDirection enterdir, TrackBits tracks, bool &path_found, bool reserve_track, PBSTileInfo *target)
+	inline Trackdir ChooseRailTrack(const Train *v, TileIndex tile, DiagDirection enterdir, TrackBits tracks, bool &path_found, bool reserve_track, PBSTileInfo *target, TileIndex *dest)
 	{
 		if (target != nullptr) target->tile = INVALID_TILE;
+		if (dest != nullptr) *dest = INVALID_TILE;
 
 		/* set origin and destination nodes */
 		PBSTileInfo origin = FollowTrainReservation(v);
@@ -449,7 +450,10 @@ public:
 			Node &best_next_node = *pPrev;
 			next_trackdir = best_next_node.GetTrackdir();
 
-			if (reserve_track && path_found) this->TryReservePath(target, pNode->GetLastTile());
+			if (reserve_track && path_found) {
+				if (dest != nullptr) *dest = Yapf().GetBestNode()->GetLastTile();
+				this->TryReservePath(target, pNode->GetLastTile());
+			}
 		}
 
 		/* Treat the path as found if stopped on the first two way signal(s). */
@@ -467,7 +471,7 @@ public:
 			pf2.DisableCache(true);
 			bool result2 = pf2.CheckReverseTrain(v, t1, td1, t2, td2, reverse_penalty);
 			if (result1 != result2) {
-				DEBUG(desync, 2, "CACHE ERROR: CheckReverseTrain() = [%s, %s]", result1 ? "T" : "F", result2 ? "T" : "F");
+				Debug(desync, 2, "CACHE ERROR: CheckReverseTrain() = [{}, {}]", result1 ? "T" : "F", result2 ? "T" : "F");
 				DumpState(pf1, pf2);
 			}
 		}
@@ -528,10 +532,10 @@ struct CYapfAnySafeTileRail1 : CYapfT<CYapfRail_TypesT<CYapfAnySafeTileRail1, CF
 struct CYapfAnySafeTileRail2 : CYapfT<CYapfRail_TypesT<CYapfAnySafeTileRail2, CFollowTrackFreeRailNo90, CRailNodeListTrackDir, CYapfDestinationAnySafeTileRailT , CYapfFollowAnySafeTileRailT> > {};
 
 
-Track YapfTrainChooseTrack(const Train *v, TileIndex tile, DiagDirection enterdir, TrackBits tracks, bool &path_found, bool reserve_track, PBSTileInfo *target)
+Track YapfTrainChooseTrack(const Train *v, TileIndex tile, DiagDirection enterdir, TrackBits tracks, bool &path_found, bool reserve_track, PBSTileInfo *target, TileIndex *dest)
 {
 	/* default is YAPF type 2 */
-	typedef Trackdir (*PfnChooseRailTrack)(const Train*, TileIndex, DiagDirection, TrackBits, bool&, bool, PBSTileInfo*);
+	typedef Trackdir (*PfnChooseRailTrack)(const Train*, TileIndex, DiagDirection, TrackBits, bool&, bool, PBSTileInfo*, TileIndex*);
 	PfnChooseRailTrack pfnChooseRailTrack = &CYapfRail1::stChooseRailTrack;
 
 	/* check if non-default YAPF type needed */
@@ -539,7 +543,7 @@ Track YapfTrainChooseTrack(const Train *v, TileIndex tile, DiagDirection enterdi
 		pfnChooseRailTrack = &CYapfRail2::stChooseRailTrack; // Trackdir, forbid 90-deg
 	}
 
-	Trackdir td_ret = pfnChooseRailTrack(v, tile, enterdir, tracks, path_found, reserve_track, target);
+	Trackdir td_ret = pfnChooseRailTrack(v, tile, enterdir, tracks, path_found, reserve_track, target, dest);
 	return (td_ret != INVALID_TRACKDIR) ? TrackdirToTrack(td_ret) : FindFirstTrack(tracks);
 }
 

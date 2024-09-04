@@ -40,8 +40,10 @@
 #include "object_base.h"
 #include "game/game.hpp"
 #include "error.h"
-#include "cmd_helper.h"
 #include "string_func.h"
+#include "industry_cmd.h"
+#include "landscape_cmd.h"
+#include "terraform_cmd.h"
 
 #include "table/strings.h"
 #include "table/industry_land.h"
@@ -149,7 +151,7 @@ Industry::~Industry()
 
 	const bool has_neutral_station = this->neutral_station != nullptr;
 
-	TILE_AREA_LOOP(tile_cur, this->location) {
+	for (TileIndex tile_cur : this->location) {
 		if (IsTileType(tile_cur, MP_INDUSTRY)) {
 			if (GetIndustryIndex(tile_cur) == this->index) {
 				DeleteNewGRFInspectWindow(GSF_INDUSTRYTILES, tile_cur);
@@ -164,7 +166,7 @@ Industry::~Industry()
 
 	if (has_neutral_station) {
 		/* Remove possible docking tiles */
-		TILE_AREA_LOOP(tile_cur, this->location) {
+		for (TileIndex tile_cur : this->location) {
 			ClearDockingTilesCheckingNeighbours(tile_cur);
 		}
 	}
@@ -173,7 +175,7 @@ Industry::~Industry()
 		TileArea ta = TileArea(this->location.tile, 0, 0).Expand(21);
 
 		/* Remove the farmland and convert it to regular tiles over time. */
-		TILE_AREA_LOOP(tile_cur, ta) {
+		for (TileIndex tile_cur : ta) {
 			if (IsTileType(tile_cur, MP_CLEAR) && IsClearGround(tile_cur, CLEAR_FIELDS) &&
 					GetIndustryIndexOfField(tile_cur) == this->index) {
 				SetIndustryIndexOfField(tile_cur, INVALID_INDUSTRY);
@@ -190,14 +192,14 @@ Industry::~Industry()
 	DecIndustryTypeCount(this->type);
 
 	DeleteIndustryNews(this->index);
-	DeleteWindowById(WC_INDUSTRY_VIEW, this->index);
+	CloseWindowById(WC_INDUSTRY_VIEW, this->index);
 	DeleteNewGRFInspectWindow(GSF_INDUSTRIES, this->index);
 
 	DeleteSubsidyWith(ST_INDUSTRY, this->index);
 	CargoPacket::InvalidateAllFrom(ST_INDUSTRY, this->index);
 
 	for (Station *st : this->stations_near) {
-		st->industries_near.erase(this);
+		st->RemoveIndustryToDeliver(this);
 	}
 }
 
@@ -1041,7 +1043,7 @@ static void PlantFarmField(TileIndex tile, IndustryID industry)
 
 	/* check the amount of bad tiles */
 	int count = 0;
-	TILE_AREA_LOOP(cur_tile, ta) {
+	for (TileIndex cur_tile : ta) {
 		assert(cur_tile < MapSize());
 		count += IsSuitableForFarmField(cur_tile, false);
 	}
@@ -1053,7 +1055,7 @@ static void PlantFarmField(TileIndex tile, IndustryID industry)
 	uint field_type = GB(r, 8, 8) * 9 >> 8;
 
 	/* make field */
-	TILE_AREA_LOOP(cur_tile, ta) {
+	for (TileIndex cur_tile : ta) {
 		assert(cur_tile < MapSize());
 		if (IsSuitableForFarmField(cur_tile, true)) {
 			MakeField(cur_tile, field_type, industry);
@@ -1100,7 +1102,7 @@ static bool SearchLumberMillTrees(TileIndex tile, void *user_data)
 		_industry_sound_tile = tile;
 		if (_settings_client.sound.ambient) SndPlayTileFx(SND_38_LUMBER_MILL_1, tile);
 
-		DoCommand(tile, 0, 0, DC_EXEC, CMD_LANDSCAPE_CLEAR);
+		Command<CMD_LANDSCAPE_CLEAR>::Do(DC_EXEC, tile);
 
 		cur_company.Restore();
 		return true;
@@ -1115,7 +1117,7 @@ static bool SearchLumberMillTrees(TileIndex tile, void *user_data)
 static void ChopLumberMillTrees(Industry *i)
 {
 	/* We only want to cut trees if all tiles are completed. */
-	TILE_AREA_LOOP(tile_cur, i->location) {
+	for (TileIndex tile_cur : i->location) {
 		if (i->TileBelongsToIndustry(tile_cur)) {
 			if (!IsIndustryCompleted(tile_cur)) return;
 		}
@@ -1427,18 +1429,12 @@ bool IsSlopeRefused(Slope current, Slope refused)
  * Are the tiles of the industry free?
  * @param tile                    Position to check.
  * @param layout                  Industry tiles table.
- * @param layout_index            The index of the layout to build/fund
  * @param type                    Type of the industry.
- * @param initial_random_bits     The random bits the industry is going to have after construction.
- * @param founder                 Industry founder
- * @param creation_type           The circumstances the industry is created under.
- * @param[out] custom_shape_check Perform custom check for the site.
  * @return Failed or succeeded command.
  */
-static CommandCost CheckIfIndustryTilesAreFree(TileIndex tile, const IndustryTileLayout &layout, size_t layout_index, int type, uint16 initial_random_bits, Owner founder, IndustryAvailabilityCallType creation_type, bool *custom_shape_check = nullptr)
+static CommandCost CheckIfIndustryTilesAreFree(TileIndex tile, const IndustryTileLayout &layout, IndustryType type)
 {
-	bool refused_slope = false;
-	bool custom_shape = false;
+	IndustryBehaviour ind_behav = GetIndustrySpec(type)->behaviour;
 
 	for (const IndustryTileLayoutTile &it : layout) {
 		IndustryGfx gfx = GetTranslatedIndustryTileID(it.gfx);
@@ -1460,19 +1456,8 @@ static CommandCost CheckIfIndustryTilesAreFree(TileIndex tile, const IndustryTil
 
 			const IndustryTileSpec *its = GetIndustryTileSpec(gfx);
 
-			IndustryBehaviour ind_behav = GetIndustrySpec(type)->behaviour;
-
 			/* Perform land/water check if not disabled */
 			if (!HasBit(its->slopes_refused, 5) && ((HasTileWaterClass(cur_tile) && IsTileOnWater(cur_tile)) == !(ind_behav & INDUSTRYBEH_BUILT_ONWATER))) return_cmd_error(STR_ERROR_SITE_UNSUITABLE);
-
-			if (HasBit(its->callback_mask, CBM_INDT_SHAPE_CHECK)) {
-				custom_shape = true;
-				CommandCost ret = PerformIndustryTileSlopeCheck(tile, cur_tile, its, type, gfx, layout_index, initial_random_bits, founder, creation_type);
-				if (ret.Failed()) return ret;
-			} else {
-				Slope tileh = GetTileSlope(cur_tile);
-				refused_slope |= IsSlopeRefused(tileh, its->slopes_refused);
-			}
 
 			if ((ind_behav & (INDUSTRYBEH_ONLY_INTOWN | INDUSTRYBEH_TOWN1200_MORE)) || // Tile must be a house
 					((ind_behav & INDUSTRYBEH_ONLY_NEARTOWN) && IsTileType(cur_tile, MP_HOUSE))) { // Tile is allowed to be a house (and it is a house)
@@ -1482,15 +1467,53 @@ static CommandCost CheckIfIndustryTilesAreFree(TileIndex tile, const IndustryTil
 
 				/* Clear the tiles as OWNER_TOWN to not affect town rating, and to not clear protected buildings */
 				Backup<CompanyID> cur_company(_current_company, OWNER_TOWN, FILE_LINE);
-				CommandCost ret = DoCommand(cur_tile, 0, 0, DC_NONE, CMD_LANDSCAPE_CLEAR);
+				CommandCost ret = Command<CMD_LANDSCAPE_CLEAR>::Do(DC_NONE, cur_tile);
 				cur_company.Restore();
 
 				if (ret.Failed()) return ret;
 			} else {
 				/* Clear the tiles, but do not affect town ratings */
-				CommandCost ret = DoCommand(cur_tile, 0, 0, DC_AUTO | DC_NO_TEST_TOWN_RATING | DC_NO_MODIFY_TOWN_RATING, CMD_LANDSCAPE_CLEAR);
-
+				CommandCost ret = Command<CMD_LANDSCAPE_CLEAR>::Do(DC_AUTO | DC_NO_TEST_TOWN_RATING | DC_NO_MODIFY_TOWN_RATING, cur_tile);
 				if (ret.Failed()) return ret;
+			}
+		}
+	}
+
+	return CommandCost();
+}
+
+/**
+ * Check slope requirements for industry tiles.
+ * @param tile                    Position to check.
+ * @param layout                  Industry tiles table.
+ * @param layout_index            The index of the layout to build/fund
+ * @param type                    Type of the industry.
+ * @param initial_random_bits     The random bits the industry is going to have after construction.
+ * @param founder                 Industry founder
+ * @param creation_type           The circumstances the industry is created under.
+ * @param[out] custom_shape_check Perform custom check for the site.
+ * @return Failed or succeeded command.
+ */
+static CommandCost CheckIfIndustryTileSlopes(TileIndex tile, const IndustryTileLayout &layout, size_t layout_index, int type, uint16 initial_random_bits, Owner founder, IndustryAvailabilityCallType creation_type, bool *custom_shape_check = nullptr)
+{
+	bool refused_slope = false;
+	bool custom_shape = false;
+
+	for (const IndustryTileLayoutTile &it : layout) {
+		IndustryGfx gfx = GetTranslatedIndustryTileID(it.gfx);
+		TileIndex cur_tile = TileAddWrap(tile, it.ti.x, it.ti.y);
+		assert(IsValidTile(cur_tile)); // checked before in CheckIfIndustryTilesAreFree
+
+		if (gfx != GFX_WATERTILE_SPECIALCHECK) {
+			const IndustryTileSpec *its = GetIndustryTileSpec(gfx);
+
+			if (HasBit(its->callback_mask, CBM_INDT_SHAPE_CHECK)) {
+				custom_shape = true;
+				CommandCost ret = PerformIndustryTileSlopeCheck(tile, cur_tile, its, type, gfx, layout_index, initial_random_bits, founder, creation_type);
+				if (ret.Failed()) return ret;
+			} else {
+				Slope tileh = GetTileSlope(cur_tile);
+				refused_slope |= IsSlopeRefused(tileh, its->slopes_refused);
 			}
 		}
 	}
@@ -1532,7 +1555,7 @@ static bool CheckCanTerraformSurroundingTiles(TileIndex tile, uint height, int i
 	if (TileX(tile) == 0 || TileY(tile) == 0 || GetTileType(tile) == MP_VOID) return false;
 
 	TileArea ta(tile - TileDiffXY(1, 1), 2, 2);
-	TILE_AREA_LOOP(tile_walk, ta) {
+	for (TileIndex tile_walk : ta) {
 		uint curh = TileHeight(tile_walk);
 		/* Is the tile clear? */
 		if ((GetTileType(tile_walk) != MP_CLEAR) && (GetTileType(tile_walk) != MP_TREES)) return false;
@@ -1587,7 +1610,7 @@ static bool CheckIfCanLevelIndustryPlatform(TileIndex tile, DoCommandFlag flags,
 	 * Perform terraforming as OWNER_TOWN to disable autoslope and town ratings. */
 	Backup<CompanyID> cur_company(_current_company, OWNER_TOWN, FILE_LINE);
 
-	TILE_AREA_LOOP(tile_walk, ta) {
+	for (TileIndex tile_walk : ta) {
 		uint curh = TileHeight(tile_walk);
 		if (curh != h) {
 			/* This tile needs terraforming. Check if we can do that without
@@ -1598,7 +1621,7 @@ static bool CheckIfCanLevelIndustryPlatform(TileIndex tile, DoCommandFlag flags,
 			}
 			/* This is not 100% correct check, but the best we can do without modifying the map.
 			 *  What is missing, is if the difference in height is more than 1.. */
-			if (DoCommand(tile_walk, SLOPE_N, (curh > h) ? 0 : 1, flags & ~DC_EXEC, CMD_TERRAFORM_LAND).Failed()) {
+			if (std::get<0>(Command<CMD_TERRAFORM_LAND>::Do(flags & ~DC_EXEC, tile_walk, SLOPE_N, curh <= h)).Failed()) {
 				cur_company.Restore();
 				return false;
 			}
@@ -1607,13 +1630,13 @@ static bool CheckIfCanLevelIndustryPlatform(TileIndex tile, DoCommandFlag flags,
 
 	if (flags & DC_EXEC) {
 		/* Terraform the land under the industry */
-		TILE_AREA_LOOP(tile_walk, ta) {
+		for (TileIndex tile_walk : ta) {
 			uint curh = TileHeight(tile_walk);
 			while (curh != h) {
 				/* We give the terraforming for free here, because we can't calculate
 				 *  exact cost in the test-round, and as we all know, that will cause
 				 *  a nice assert if they don't match ;) */
-				DoCommand(tile_walk, SLOPE_N, (curh > h) ? 0 : 1, flags, CMD_TERRAFORM_LAND);
+				Command<CMD_TERRAFORM_LAND>::Do(flags, tile_walk, SLOPE_N, curh <= h);
 				curh += (curh > h) ? -1 : 1;
 			}
 		}
@@ -1639,7 +1662,7 @@ static CommandCost CheckIfFarEnoughFromConflictingIndustry(TileIndex tile, int t
 	if (Industry::GetNumItems() > (size_t) (dmax * dmax * 2)) {
 		const Industry* i = nullptr;
 		TileArea tile_area = TileArea(tile, 1, 1).Expand(dmax);
-		TILE_AREA_LOOP(atile, tile_area) {
+		for (TileIndex atile : tile_area) {
 			if (GetTileType(atile) == MP_INDUSTRY) {
 				const Industry *i2 = Industry::GetByTile(atile);
 				if (i == i2) continue;
@@ -1699,15 +1722,15 @@ static void PopulateStationsNearby(Industry *ind)
 		/* Industry has a neutral station. Use it and ignore any other nearby stations. */
 		ind->stations_near.insert(ind->neutral_station);
 		ind->neutral_station->industries_near.clear();
-		ind->neutral_station->industries_near.insert(ind);
+		ind->neutral_station->industries_near.insert(IndustryListEntry{0, ind});
 		return;
 	}
 
 	ForAllStationsAroundTiles(ind->location, [ind](Station *st, TileIndex tile) {
 		if (!IsTileType(tile, MP_INDUSTRY) || GetIndustryIndex(tile) != ind->index) return false;
 		ind->stations_near.insert(st);
-		st->AddIndustryToDeliver(ind);
-		return true;
+		st->AddIndustryToDeliver(ind, tile);
+		return false;
 	});
 }
 
@@ -1883,7 +1906,7 @@ static void DoCreateNewIndustry(Industry *i, TileIndex tile, IndustryType type, 
 
 			WaterClass wc = (IsWaterTile(cur_tile) ? GetWaterClass(cur_tile) : WATER_CLASS_INVALID);
 
-			DoCommand(cur_tile, 0, 0, DC_EXEC | DC_NO_TEST_TOWN_RATING | DC_NO_MODIFY_TOWN_RATING, CMD_LANDSCAPE_CLEAR);
+			Command<CMD_LANDSCAPE_CLEAR>::Do(DC_EXEC | DC_NO_TEST_TOWN_RATING | DC_NO_MODIFY_TOWN_RATING, cur_tile);
 
 			MakeIndustry(cur_tile, i->index, it.gfx, Random(), wc);
 
@@ -1927,28 +1950,11 @@ static CommandCost CreateNewIndustryHelper(TileIndex tile, IndustryType type, Do
 {
 	assert(layout_index < indspec->layouts.size());
 	const IndustryTileLayout &layout = indspec->layouts[layout_index];
-	bool custom_shape_check = false;
 
 	*ip = nullptr;
 
-	std::vector<ClearedObjectArea> object_areas(_cleared_object_areas);
-	CommandCost ret = CheckIfIndustryTilesAreFree(tile, layout, layout_index, type, random_initial_bits, founder, creation_type, &custom_shape_check);
-	_cleared_object_areas = object_areas;
-	if (ret.Failed()) return ret;
-
-	if (HasBit(GetIndustrySpec(type)->callback_mask, CBM_IND_LOCATION)) {
-		ret = CheckIfCallBackAllowsCreation(tile, type, layout_index, random_var8f, random_initial_bits, founder, creation_type);
-	} else {
-		ret = _check_new_industry_procs[indspec->check_proc](tile);
-	}
-	if (ret.Failed()) return ret;
-
-	if (!custom_shape_check && _settings_game.game_creation.land_generator == LG_TERRAGENESIS && _generating_world &&
-			!_ignore_restrictions && !CheckIfCanLevelIndustryPlatform(tile, DC_NO_WATER, layout, type)) {
-		return_cmd_error(STR_ERROR_SITE_UNSUITABLE);
-	}
-
-	ret = CheckIfFarEnoughFromConflictingIndustry(tile, type);
+	/* 1. Cheap: Built-in checks on industry level. */
+	CommandCost ret = CheckIfFarEnoughFromConflictingIndustry(tile, type);
 	if (ret.Failed()) return ret;
 
 	Town *t = nullptr;
@@ -1958,6 +1964,30 @@ static CommandCost CreateNewIndustryHelper(TileIndex tile, IndustryType type, Do
 
 	ret = CheckIfIndustryIsAllowed(tile, type, t);
 	if (ret.Failed()) return ret;
+
+	/* 2. Built-in checks on industry tiles. */
+	std::vector<ClearedObjectArea> object_areas(_cleared_object_areas);
+	ret = CheckIfIndustryTilesAreFree(tile, layout, type);
+	_cleared_object_areas = object_areas;
+	if (ret.Failed()) return ret;
+
+	/* 3. NewGRF-defined checks on industry level. */
+	if (HasBit(GetIndustrySpec(type)->callback_mask, CBM_IND_LOCATION)) {
+		ret = CheckIfCallBackAllowsCreation(tile, type, layout_index, random_var8f, random_initial_bits, founder, creation_type);
+	} else {
+		ret = _check_new_industry_procs[indspec->check_proc](tile);
+	}
+	if (ret.Failed()) return ret;
+
+	/* 4. Expensive: NewGRF-defined checks on industry tiles. */
+	bool custom_shape_check = false;
+	ret = CheckIfIndustryTileSlopes(tile, layout, layout_index, type, random_initial_bits, founder, creation_type, &custom_shape_check);
+	if (ret.Failed()) return ret;
+
+	if (!custom_shape_check && _settings_game.game_creation.land_generator == LG_TERRAGENESIS && _generating_world &&
+			!_ignore_restrictions && !CheckIfCanLevelIndustryPlatform(tile, DC_NO_WATER, layout, type)) {
+		return_cmd_error(STR_ERROR_SITE_UNSUITABLE);
+	}
 
 	if (!Industry::CanAllocateItem()) return_cmd_error(STR_ERROR_TOO_MANY_INDUSTRIES);
 
@@ -1972,19 +2002,16 @@ static CommandCost CreateNewIndustryHelper(TileIndex tile, IndustryType type, Do
 
 /**
  * Build/Fund an industry
- * @param tile tile where industry is built
  * @param flags of operations to conduct
- * @param p1 various bitstuffed elements
- * - p1 = (bit  0 -  7) - industry type see build_industry.h and see industry.h
- * - p1 = (bit  8 - 15) - first layout to try
- * - p1 = (bit 16     ) - 0 = prospect, 1 = fund (only valid if current company is DEITY)
- * @param p2 seed to use for desyncfree randomisations
- * @param text unused
+ * @param tile tile where industry is built
+ * @param it industry type see build_industry.h and see industry.h
+ * @param first_layout first layout to try
+ * @param fund false = prospect, true = fund (only valid if current company is DEITY)
+ * @param seed seed to use for desyncfree randomisations
  * @return the cost of this operation or an error
  */
-CommandCost CmdBuildIndustry(TileIndex tile, DoCommandFlag flags, uint32 p1, uint32 p2, const char *text)
+CommandCost CmdBuildIndustry(DoCommandFlag flags, TileIndex tile, IndustryType it, uint32 first_layout, bool fund, uint32 seed)
 {
-	IndustryType it = GB(p1, 0, 8);
 	if (it >= NUM_INDUSTRYTYPES) return CMD_ERROR;
 
 	const IndustrySpec *indspec = GetIndustrySpec(it);
@@ -2003,22 +2030,23 @@ CommandCost CmdBuildIndustry(TileIndex tile, DoCommandFlag flags, uint32 p1, uin
 	}
 
 	Randomizer randomizer;
-	randomizer.SetSeed(p2);
-	uint16 random_initial_bits = GB(p2, 0, 16);
+	randomizer.SetSeed(seed);
+	uint16 random_initial_bits = GB(seed, 0, 16);
 	uint32 random_var8f = randomizer.Next();
 	size_t num_layouts = indspec->layouts.size();
 	CommandCost ret = CommandCost(STR_ERROR_SITE_UNSUITABLE);
-	const bool deity_prospect = _current_company == OWNER_DEITY && !HasBit(p1, 16);
+	const bool deity_prospect = _current_company == OWNER_DEITY && !fund;
 
 	Industry *ind = nullptr;
 	if (deity_prospect || (_game_mode != GM_EDITOR && _current_company != OWNER_DEITY && _settings_game.construction.raw_industry_construction == 2 && indspec->IsRawIndustry())) {
 		if (flags & DC_EXEC) {
-			/* Prospected industries are build as OWNER_TOWN to not e.g. be build on owned land of the founder */
-			Backup<CompanyID> cur_company(_current_company, OWNER_TOWN, FILE_LINE);
 			/* Prospecting has a chance to fail, however we cannot guarantee that something can
 			 * be built on the map, so the chance gets lower when the map is fuller, but there
 			 * is nothing we can really do about that. */
-			if (deity_prospect || Random() <= indspec->prospecting_chance) {
+			bool prospect_success = deity_prospect || Random() <= indspec->prospecting_chance;
+			if (prospect_success) {
+				/* Prospected industries are build as OWNER_TOWN to not e.g. be build on owned land of the founder */
+				Backup<CompanyID> cur_company(_current_company, OWNER_TOWN, FILE_LINE);
 				for (int i = 0; i < 5000; i++) {
 					/* We should not have more than one Random() in a function call
 					 * because parameter evaluation order is not guaranteed in the c++ standard
@@ -2034,11 +2062,18 @@ CommandCost CmdBuildIndustry(TileIndex tile, DoCommandFlag flags, uint32 p1, uin
 					}
 					if (ret.Succeeded()) break;
 				}
+				cur_company.Restore();
 			}
-			cur_company.Restore();
+			if (ret.Failed()) {
+				if (prospect_success) {
+					ShowErrorMessage(STR_ERROR_CAN_T_PROSPECT_INDUSTRY, STR_ERROR_NO_SUITABLE_PLACES_FOR_PROSPECTING, WL_INFO);
+				} else {
+					ShowErrorMessage(STR_ERROR_CAN_T_PROSPECT_INDUSTRY, STR_ERROR_PROSPECTING_WAS_UNLUCKY, WL_INFO);
+				}
+			}
 		}
 	} else {
-		size_t layout = GB(p1, 8, 8);
+		size_t layout = first_layout;
 		if (layout >= num_layouts) return CMD_ERROR;
 
 		/* Check subsequently each layout, starting with the given layout in p1 */
@@ -2061,41 +2096,32 @@ CommandCost CmdBuildIndustry(TileIndex tile, DoCommandFlag flags, uint32 p1, uin
 
 /**
  * Change industry properties
- * @param tile Unused.
  * @param flags Type of operation.
- * @param p1 IndustryID
- * @param p2 various bitstuffed elements
- * - p2 = (bit 0 - 7) - IndustryAction to perform
- * - p2 = (bit 8 - 15) - IndustryControlFlags
- *                       (only used with set control flags)
- * - p2 = (bit 16 - 23) - CompanyID to set or INVALID_OWNER (available to everyone) or
- *                        OWNER_NONE (neutral stations only) or OWNER_DEITY (no one)
- *                        (only used with set exclusive supplier / consumer)
+ * @param ind_id IndustryID
+ * @param action IndustryAction to perform
+ * @param ctlflags IndustryControlFlags (only used with set control flags)
+ * @param company_id CompanyID to set or INVALID_OWNER (available to everyone) or
+ *                   OWNER_NONE (neutral stations only) or OWNER_DEITY (no one)
+ *                   (only used with set exclusive supplier / consumer)
  * @param text - Additional industry text (only used with set text action)
  * @return Empty cost or an error.
  */
-CommandCost CmdIndustryCtrl(TileIndex tile, DoCommandFlag flags, uint32 p1, uint32 p2, const char *text)
+CommandCost CmdIndustryCtrl(DoCommandFlag flags, IndustryID ind_id, IndustryAction action, IndustryControlFlags ctlflags, Owner company_id, const std::string &text)
 {
 	if (_current_company != OWNER_DEITY) return CMD_ERROR;
 
-	Industry *ind = Industry::GetIfValid(p1);
+	Industry *ind = Industry::GetIfValid(ind_id);
 	if (ind == nullptr) return CMD_ERROR;
-
-	auto action = static_cast<IndustryAction>(GB(p2, 0, 8));
 
 	switch (action) {
 		case IndustryAction::SetControlFlags: {
-			IndustryControlFlags ctlflags = (IndustryControlFlags)GB(p2, 8, 8) & INDCTL_MASK;
-
-			if (flags & DC_EXEC) ind->ctlflags = ctlflags;
+			if (flags & DC_EXEC) ind->ctlflags = ctlflags & INDCTL_MASK;
 
 			break;
 		}
 
 		case IndustryAction::SetExclusiveSupplier:
 		case IndustryAction::SetExclusiveConsumer: {
-			Owner company_id = (Owner)GB(p2, 16, 8);
-
 			if (company_id != OWNER_NONE && company_id != INVALID_OWNER && company_id != OWNER_DEITY
 				&& !Company::IsValidID(company_id)) return CMD_ERROR;
 
@@ -2112,13 +2138,13 @@ CommandCost CmdIndustryCtrl(TileIndex tile, DoCommandFlag flags, uint32 p1, uint
 
 		case IndustryAction::SetText: {
 			ind->text.clear();
-			if (!StrEmpty(text)) ind->text = text;
+			if (!text.empty()) ind->text = text;
 			InvalidateWindowData(WC_INDUSTRY_VIEW, ind->index);
 			break;
 		}
 
 		default:
-			NOT_REACHED();
+			return CMD_ERROR;
 	}
 
 	return CommandCost();
@@ -2139,8 +2165,7 @@ static Industry *CreateNewIndustry(TileIndex tile, IndustryType type, IndustryAv
 	uint32 seed2 = Random();
 	Industry *i = nullptr;
 	size_t layout_index = RandomRange((uint32)indspec->layouts.size());
-	CommandCost ret = CreateNewIndustryHelper(tile, type, DC_EXEC, indspec, layout_index, seed, GB(seed2, 0, 16), OWNER_NONE, creation_type, &i);
-	(void)ret; // assert only
+	[[maybe_unused]] CommandCost ret = CreateNewIndustryHelper(tile, type, DC_EXEC, indspec, layout_index, seed, GB(seed2, 0, 16), OWNER_NONE, creation_type, &i);
 	assert(i != nullptr || ret.Failed());
 	return i;
 }
@@ -2579,7 +2604,7 @@ static void CanCargoServiceIndustry(CargoID cargo, Industry *ind, bool *c_accept
 /**
  * Compute who can service the industry.
  *
- * Here, 'can service' means that he/she has trains and stations close enough
+ * Here, 'can service' means that they have trains and stations close enough
  * to the industry with the right cargo type and the right orders (ie has the
  * technical means).
  *
@@ -3060,7 +3085,7 @@ static CommandCost TerraformTile_Industry(TileIndex tile, DoCommandFlag flags, i
 			}
 		}
 	}
-	return DoCommand(tile, 0, 0, flags, CMD_LANDSCAPE_CLEAR);
+	return Command<CMD_LANDSCAPE_CLEAR>::Do(flags, tile);
 }
 
 extern const TileTypeProcs _tile_type_industry_procs = {
@@ -3080,7 +3105,8 @@ extern const TileTypeProcs _tile_type_industry_procs = {
 	TerraformTile_Industry,      // terraform_tile_proc
 };
 
-bool IndustryCompare::operator() (const Industry *lhs, const Industry *rhs) const
+bool IndustryCompare::operator() (const IndustryListEntry &lhs, const IndustryListEntry &rhs) const
 {
-	return lhs->index < rhs->index;
+	/* Compare by distance first and use index as a tiebreaker. */
+	return std::tie(lhs.distance, lhs.industry->index) < std::tie(rhs.distance, rhs.industry->index);
 }

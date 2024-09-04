@@ -88,6 +88,7 @@
 #include "command_func.h"
 #include "network/network_func.h"
 #include "framerate_type.h"
+#include "viewport_cmd.h"
 #include "build_confirmation_func.h"
 
 #include <forward_list>
@@ -134,6 +135,7 @@ struct ChildScreenSpriteToDraw {
 	const SubSprite *sub;           ///< only draw a rectangular part of the sprite
 	int32 x;
 	int32 y;
+	bool relative;
 	int next;                       ///< next child to draw (-1 at the end)
 };
 
@@ -246,8 +248,8 @@ void InitializeWindowViewport(Window *w, int x, int y,
 		veh = Vehicle::Get(vp->follow_vehicle);
 		pt = MapXYZToViewport(vp, veh->x_pos, veh->y_pos, veh->z_pos);
 	} else {
-		uint x = TileX(follow_flags) * TILE_SIZE;
-		uint y = TileY(follow_flags) * TILE_SIZE;
+		x = TileX(follow_flags) * TILE_SIZE;
+		y = TileY(follow_flags) * TILE_SIZE;
 
 		vp->follow_vehicle = INVALID_VEHICLE;
 		pt = MapXYZToViewport(vp, x, y, GetSlopePixelZ(x, y));
@@ -267,35 +269,36 @@ void InitializeWindowViewport(Window *w, int x, int y,
 
 static Point _vp_move_offs;
 
-static void DoSetViewportPosition(const Window *w, int left, int top, int width, int height)
+static void DoSetViewportPosition(Window::IteratorToFront it, int left, int top, int width, int height)
 {
-	for (const Window *w : Window::IterateFromBack(w)) {
+	for (; !it.IsEnd(); ++it) {
+		const Window *w = *it;
 		if (left + width > w->left &&
 				w->left + w->width > left &&
 				top + height > w->top &&
 				w->top + w->height > top) {
 
 			if (left < w->left) {
-				DoSetViewportPosition(w, left, top, w->left - left, height);
-				DoSetViewportPosition(w, left + (w->left - left), top, width - (w->left - left), height);
+				DoSetViewportPosition(it, left, top, w->left - left, height);
+				DoSetViewportPosition(it, left + (w->left - left), top, width - (w->left - left), height);
 				return;
 			}
 
 			if (left + width > w->left + w->width) {
-				DoSetViewportPosition(w, left, top, (w->left + w->width - left), height);
-				DoSetViewportPosition(w, left + (w->left + w->width - left), top, width - (w->left + w->width - left), height);
+				DoSetViewportPosition(it, left, top, (w->left + w->width - left), height);
+				DoSetViewportPosition(it, left + (w->left + w->width - left), top, width - (w->left + w->width - left), height);
 				return;
 			}
 
 			if (top < w->top) {
-				DoSetViewportPosition(w, left, top, width, (w->top - top));
-				DoSetViewportPosition(w, left, top + (w->top - top), width, height - (w->top - top));
+				DoSetViewportPosition(it, left, top, width, (w->top - top));
+				DoSetViewportPosition(it, left, top + (w->top - top), width, height - (w->top - top));
 				return;
 			}
 
 			if (top + height > w->top + w->height) {
-				DoSetViewportPosition(w, left, top, width, (w->top + w->height - top));
-				DoSetViewportPosition(w, left, top + (w->top + w->height - top), width, height - (w->top + w->height - top));
+				DoSetViewportPosition(it, left, top, width, (w->top + w->height - top));
+				DoSetViewportPosition(it, left, top + (w->top + w->height - top), width, height - (w->top + w->height - top));
 				return;
 			}
 
@@ -381,7 +384,11 @@ static void SetViewportPosition(Window *w, int x, int y)
 		i = top + height - _screen.height;
 		if (i >= 0) height -= i;
 
-		if (height > 0) DoSetViewportPosition(w->z_front, left, top, width, height);
+		if (height > 0) {
+			Window::IteratorToFront it(w);
+			++it;
+			DoSetViewportPosition(it, left, top, width, height);
+		}
 	}
 }
 
@@ -532,7 +539,7 @@ static void AddChildSpriteToFoundation(SpriteID image, PaletteID pal, const SubS
 	int *old_child = _vd.last_child;
 	_vd.last_child = _vd.last_foundation_child[foundation_part];
 
-	AddChildSpriteScreen(image, pal, offs.x + extra_offs_x, offs.y + extra_offs_y, false, sub, false);
+	AddChildSpriteScreen(image, pal, offs.x + extra_offs_x, offs.y + extra_offs_y, false, sub, false, false);
 
 	/* Switch back to last ChildSprite list */
 	_vd.last_child = old_child;
@@ -811,8 +818,10 @@ bool IsInsideRotatedRectangle(int x, int y)
  * @param y sprite y-offset (screen coordinates) relative to parent sprite.
  * @param transparent if true, switch the palette between the provided palette and the transparent palette,
  * @param sub Only draw a part of the sprite.
+ * @param scale if true, scale offsets to base zoom level.
+ * @param relative if true, draw sprite relative to parent sprite offsets.
  */
-void AddChildSpriteScreen(SpriteID image, PaletteID pal, int x, int y, bool transparent, const SubSprite *sub, bool scale)
+void AddChildSpriteScreen(SpriteID image, PaletteID pal, int x, int y, bool transparent, const SubSprite *sub, bool scale, bool relative)
 {
 	assert((image & SPRITE_MASK) < MAX_SPRITES);
 
@@ -833,6 +842,7 @@ void AddChildSpriteScreen(SpriteID image, PaletteID pal, int x, int y, bool tran
 	cs.sub = sub;
 	cs.x = scale ? x * ZOOM_LVL_BASE : x;
 	cs.y = scale ? y * ZOOM_LVL_BASE : y;
+	cs.relative = relative;
 	cs.next = -1;
 
 	/* Append the sprite to the active ChildSprite list.
@@ -867,16 +877,18 @@ static void AddStringToDraw(int x, int y, StringID string, uint64 params_1, uint
  * @param ti TileInfo Tile that is being drawn
  * @param z_offset Z offset relative to the groundsprite. Only used for the sprite position, not for sprite sorting.
  * @param foundation_part Foundation part the sprite belongs to.
+ * @param extra_offs_x Pixel X offset for the sprite position.
+ * @param extra_offs_y Pixel Y offset for the sprite position.
  */
-static void DrawSelectionSprite(SpriteID image, PaletteID pal, const TileInfo *ti, int z_offset, FoundationPart foundation_part)
+static void DrawSelectionSprite(SpriteID image, PaletteID pal, const TileInfo *ti, int z_offset, FoundationPart foundation_part, int extra_offs_x = 0, int extra_offs_y = 0)
 {
 	/* FIXME: This is not totally valid for some autorail highlights that extend over the edges of the tile. */
 	if (_vd.foundation[foundation_part] == -1) {
 		/* draw on real ground */
-		AddTileSpriteToDraw(image, pal, ti->x, ti->y, ti->z + z_offset);
+		AddTileSpriteToDraw(image, pal, ti->x, ti->y, ti->z + z_offset, nullptr, extra_offs_x, extra_offs_y);
 	} else {
 		/* draw on top of foundation */
-		AddChildSpriteToFoundation(image, pal, nullptr, foundation_part, 0, -z_offset * ZOOM_LVL_BASE);
+		AddChildSpriteToFoundation(image, pal, nullptr, foundation_part, extra_offs_x, extra_offs_y - z_offset * ZOOM_LVL_BASE);
 	}
 }
 
@@ -1296,7 +1308,7 @@ void ViewportAddString(const DrawPixelInfo *dpi, ZoomLevel small_from, const Vie
 	int right  = left + dpi->width;
 	int bottom = top + dpi->height;
 
-	int sign_height     = ScaleByZoom(VPSM_TOP + FONT_HEIGHT_NORMAL + VPSM_BOTTOM, dpi->zoom);
+	int sign_height     = ScaleByZoom(WidgetDimensions::scaled.fullbevel.top + FONT_HEIGHT_NORMAL + WidgetDimensions::scaled.fullbevel.bottom, dpi->zoom);
 	int sign_half_width = ScaleByZoom((small ? sign->width_small : sign->width_normal) / 2, dpi->zoom);
 
 	if (bottom < sign->top ||
@@ -1312,7 +1324,7 @@ void ViewportAddString(const DrawPixelInfo *dpi, ZoomLevel small_from, const Vie
 		int shadow_offset = 0;
 		if (string_small_shadow != STR_NULL) {
 			shadow_offset = 4;
-			AddStringToDraw(sign->center - sign_half_width + shadow_offset, sign->top, string_small_shadow, params_1, params_2, INVALID_COLOUR, sign->width_small);
+			AddStringToDraw(sign->center - sign_half_width + shadow_offset, sign->top, string_small_shadow, params_1, params_2, INVALID_COLOUR, sign->width_small | 0x8000);
 		}
 		AddStringToDraw(sign->center - sign_half_width, sign->top - shadow_offset, string_small, params_1, params_2,
 				colour, sign->width_small | 0x8000);
@@ -1324,8 +1336,8 @@ static Rect ExpandRectWithViewportSignMargins(Rect r, ZoomLevel zoom)
 	/* Pessimistically always use normal font, but also assume small font is never larger in either dimension */
 	const int fh = FONT_HEIGHT_NORMAL;
 	const int max_tw = _viewport_sign_maxwidth / 2 + 1;
-	const int expand_y = ScaleByZoom(VPSM_TOP + fh + VPSM_BOTTOM, zoom);
-	const int expand_x = ScaleByZoom(VPSM_LEFT + max_tw + VPSM_RIGHT, zoom);
+	const int expand_y = ScaleByZoom(WidgetDimensions::scaled.fullbevel.top + fh + WidgetDimensions::scaled.fullbevel.bottom, zoom);
+	const int expand_x = ScaleByZoom(WidgetDimensions::scaled.fullbevel.left + max_tw + WidgetDimensions::scaled.fullbevel.right, zoom);
 
 	r.left -= expand_x;
 	r.right += expand_x;
@@ -1418,12 +1430,12 @@ static void ViewportAddKdtreeSigns(DrawPixelInfo *dpi)
 		if (Station::IsExpected(st)) {
 			/* Station */
 			ViewportAddString(dpi, ZOOM_LVL_OUT_16X, &st->sign,
-				STR_VIEWPORT_STATION, STR_VIEWPORT_STATION + 1, STR_NULL,
+				STR_VIEWPORT_STATION, STR_VIEWPORT_STATION_TINY, STR_NULL,
 				st->index, st->facilities, (st->owner == OWNER_NONE || !st->IsInUse()) ? COLOUR_GREY : _company_colours[st->owner]);
 		} else {
 			/* Waypoint */
 			ViewportAddString(dpi, ZOOM_LVL_OUT_16X, &st->sign,
-				STR_VIEWPORT_WAYPOINT, STR_VIEWPORT_WAYPOINT + 1, STR_NULL,
+				STR_VIEWPORT_WAYPOINT, STR_VIEWPORT_WAYPOINT_TINY, STR_NULL,
 				st->index, st->facilities, (st->owner == OWNER_NONE || !st->IsInUse()) ? COLOUR_GREY : _company_colours[st->owner]);
 		}
 	}
@@ -1446,14 +1458,14 @@ void ViewportSign::UpdatePosition(int center, int top, StringID str, StringID st
 	char buffer[DRAW_STRING_BUFFER];
 
 	GetString(buffer, str, lastof(buffer));
-	this->width_normal = VPSM_LEFT + Align(GetStringBoundingBox(buffer).width, 2) + VPSM_RIGHT;
+	this->width_normal = WidgetDimensions::scaled.fullbevel.left + Align(GetStringBoundingBox(buffer).width, 2) + WidgetDimensions::scaled.fullbevel.right;
 	this->center = center;
 
 	/* zoomed out version */
 	if (str_small != STR_NULL) {
 		GetString(buffer, str_small, lastof(buffer));
 	}
-	this->width_small = VPSM_LEFT + Align(GetStringBoundingBox(buffer, FS_SMALL).width, 2) + VPSM_RIGHT;
+	this->width_small = WidgetDimensions::scaled.fullbevel.left + Align(GetStringBoundingBox(buffer, FS_SMALL).width, 2) + WidgetDimensions::scaled.fullbevel.right;
 
 	this->MarkDirty();
 }
@@ -1473,10 +1485,10 @@ void ViewportSign::MarkDirty(ZoomLevel maxzoom) const
 		zoomlevels[zoom].left   = this->center - ScaleByZoom(this->width_normal / 2 + 1, zoom);
 		zoomlevels[zoom].top    = this->top    - ScaleByZoom(1, zoom);
 		zoomlevels[zoom].right  = this->center + ScaleByZoom(this->width_normal / 2 + 1, zoom);
-		zoomlevels[zoom].bottom = this->top    + ScaleByZoom(VPSM_TOP + FONT_HEIGHT_NORMAL + VPSM_BOTTOM + 1, zoom);
+		zoomlevels[zoom].bottom = this->top    + ScaleByZoom(WidgetDimensions::scaled.fullbevel.top + FONT_HEIGHT_NORMAL + WidgetDimensions::scaled.fullbevel.bottom + 1, zoom);
 	}
 
-	for (const Window *w : Window::IterateFromBack()) {
+	for (const Window *w : Window::Iterate()) {
 		Viewport *vp = w->viewport;
 		if (vp != nullptr && vp->zoom <= maxzoom) {
 			assert(vp->width != 0);
@@ -1629,7 +1641,11 @@ static void ViewportDrawParentSprites(const ParentSpriteToSortVector *psd, const
 		while (child_idx >= 0) {
 			const ChildScreenSpriteToDraw *cs = csstdv->data() + child_idx;
 			child_idx = cs->next;
-			DrawSpriteViewport(cs->image, cs->pal, ps->left + cs->x, ps->top + cs->y, cs->sub);
+			if (cs->relative) {
+				DrawSpriteViewport(cs->image, cs->pal, ps->left + cs->x, ps->top + cs->y, cs->sub);
+			} else {
+				DrawSpriteViewport(cs->image, cs->pal, ps->x + cs->x, ps->y + cs->y, cs->sub);
+			}
 		}
 	}
 }
@@ -1683,7 +1699,7 @@ static void ViewportDrawStrings(ZoomLevel zoom, const StringSpriteToDrawVector *
 		int w = GB(ss.width, 0, 15);
 		int x = UnScaleByZoom(ss.x, zoom);
 		int y = UnScaleByZoom(ss.y, zoom);
-		int h = VPSM_TOP + (small ? FONT_HEIGHT_SMALL : FONT_HEIGHT_NORMAL) + VPSM_BOTTOM;
+		int h = WidgetDimensions::scaled.fullbevel.top + (small ? FONT_HEIGHT_SMALL : FONT_HEIGHT_NORMAL) + WidgetDimensions::scaled.fullbevel.bottom;
 
 		SetDParam(0, ss.params[0]);
 		SetDParam(1, ss.params[1]);
@@ -1701,13 +1717,13 @@ static void ViewportDrawStrings(ZoomLevel zoom, const StringSpriteToDrawVector *
 				/* Draw the rectangle if 'transparent station signs' is off,
 				 * or if we are drawing a general text sign (STR_WHITE_SIGN). */
 				DrawFrameRect(
-					x, y, x + w, y + h, ss.colour,
+					x, y, x + w - 1, y + h - 1, ss.colour,
 					IsTransparencySet(TO_SIGNS) ? FR_TRANSPARENT : FR_NONE
 				);
 			}
 		}
 
-		DrawString(x + VPSM_LEFT, x + w - 1 - VPSM_RIGHT, y + VPSM_TOP, ss.string, colour, SA_HOR_CENTER);
+		DrawString(x + WidgetDimensions::scaled.fullbevel.left, x + w - 1 - WidgetDimensions::scaled.fullbevel.right, y + WidgetDimensions::scaled.fullbevel.top, ss.string, colour, SA_HOR_CENTER, false, small ? FS_SMALL : FS_NORMAL);
 	}
 }
 
@@ -1949,7 +1965,7 @@ bool MarkAllViewportsDirty(int left, int top, int right, int bottom)
 {
 	bool dirty = false;
 
-	for (const Window *w : Window::IterateFromBack()) {
+	for (const Window *w : Window::Iterate()) {
 		Viewport *vp = w->viewport;
 		if (vp != nullptr) {
 			assert(vp->width != 0);
@@ -1962,7 +1978,7 @@ bool MarkAllViewportsDirty(int left, int top, int right, int bottom)
 
 void ConstrainAllViewportsZoom()
 {
-	for (Window *w : Window::IterateFromFront()) {
+	for (Window *w : Window::Iterate()) {
 		if (w->viewport == nullptr) continue;
 
 		ZoomLevel zoom = static_cast<ZoomLevel>(Clamp(w->viewport->zoom, _settings_client.gui.zoom_min, _settings_client.gui.zoom_max));
@@ -2126,7 +2142,7 @@ static bool CheckClickOnViewportSign(const Viewport *vp, int x, int y, const Vie
 {
 	bool small = (vp->zoom >= ZOOM_LVL_OUT_16X);
 	int sign_half_width = ScaleByZoom((small ? sign->width_small : sign->width_normal) / 2, vp->zoom);
-	int sign_height = ScaleByZoom(VPSM_TOP + (small ? FONT_HEIGHT_SMALL : FONT_HEIGHT_NORMAL) + VPSM_BOTTOM, vp->zoom);
+	int sign_height = ScaleByZoom(WidgetDimensions::scaled.fullbevel.top + (small ? FONT_HEIGHT_SMALL : FONT_HEIGHT_NORMAL) + WidgetDimensions::scaled.fullbevel.bottom, vp->zoom);
 
 	return y >= sign->top && y < sign->top + sign_height &&
 			x >= sign->center - sign_half_width && x < sign->center + sign_half_width;
@@ -2377,7 +2393,7 @@ bool HandleViewportMouseUp(const Viewport *vp, int x, int y)
 	bool result = CheckClickOnLandscape(vp, x, y);
 
 	if (v != nullptr) {
-		DEBUG(misc, 2, "Vehicle %d (index %d) at %p", v->unitnumber, v->index, v);
+		Debug(misc, 2, "Vehicle {} (index {}) at {}", v->unitnumber, v->index, fmt::ptr(v));
 		if (IsCompanyBuildableVehicleType(v)) {
 			v = v->First();
 			if (_ctrl_pressed && v->owner == _local_company) {
@@ -2665,7 +2681,7 @@ static inline void ShowMeasurementTooltips(StringID str, uint paramcount, const 
 
 static void HideMeasurementTooltips()
 {
-	DeleteWindowById(WC_TOOLTIPS, 0);
+	CloseWindowById(WC_TOOLTIPS, 0);
 }
 
 /** highlighting tiles while only going over them with the mouse */
@@ -3524,25 +3540,23 @@ void InitializeSpriteSorter()
 
 /**
  * Scroll players main viewport.
- * @param tile tile to center viewport on
  * @param flags type of operation
- * @param p1 ViewportScrollTarget of scroll target
- * @param p2 company or client id depending on the target
- * @param text unused
+ * @param tile tile to center viewport on
+ * @param target ViewportScrollTarget of scroll target
+ * @param ref company or client id depending on the target
  * @return the cost of this operation or an error
  */
-CommandCost CmdScrollViewport(TileIndex tile, DoCommandFlag flags, uint32 p1, uint32 p2, const char *text)
+CommandCost CmdScrollViewport(DoCommandFlag flags, TileIndex tile, ViewportScrollTarget target, uint32 ref)
 {
 	if (_current_company != OWNER_DEITY) return CMD_ERROR;
-	ViewportScrollTarget target = (ViewportScrollTarget)p1;
 	switch (target) {
 		case VST_EVERYONE:
 			break;
 		case VST_COMPANY:
-			if (_local_company != (CompanyID)p2) return CommandCost();
+			if (_local_company != (CompanyID)ref) return CommandCost();
 			break;
 		case VST_CLIENT:
-			if (_network_own_client_id != (ClientID)p2) return CommandCost();
+			if (_network_own_client_id != (ClientID)ref) return CommandCost();
 			break;
 		default:
 			return CMD_ERROR;
@@ -3555,7 +3569,7 @@ CommandCost CmdScrollViewport(TileIndex tile, DoCommandFlag flags, uint32 p1, ui
 	return CommandCost();
 }
 
-static void MarkCatchmentTilesDirty()
+void MarkCatchmentTilesDirty()
 {
 	if (_viewport_highlight_town != nullptr) {
 		MarkWholeScreenDirty();

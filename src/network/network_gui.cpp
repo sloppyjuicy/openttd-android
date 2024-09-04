@@ -18,6 +18,7 @@
 #include "network_base.h"
 #include "network_content.h"
 #include "network_server.h"
+#include "network_coordinator.h"
 #include "../gui.h"
 #include "network_udp.h"
 #include "../window_func.h"
@@ -29,6 +30,7 @@
 #include "../company_func.h"
 #include "../command_func.h"
 #include "../core/geometry_func.hpp"
+#include "../video/video_driver.hpp"
 #include "../genworld.h"
 #include "../map_type.h"
 #include "../guitimer_func.h"
@@ -36,6 +38,7 @@
 #include "../zoom_func.h"
 #include "../sprite.h"
 #include "../settings_internal.h"
+#include "../company_cmd.h"
 
 #include "../widgets/network_widget.h"
 
@@ -53,20 +56,11 @@
 #include "../safeguards.h"
 
 static void ShowNetworkStartServerWindow();
-static void ShowNetworkLobbyWindow(NetworkGameList *ngl);
+
+static const int NETWORK_LIST_REFRESH_DELAY = 30; ///< Time, in seconds, between updates of the network list.
 
 static ClientID _admin_client_id = INVALID_CLIENT_ID; ///< For what client a confirmation window is open.
 static CompanyID _admin_company_id = INVALID_COMPANY; ///< For what company a confirmation window is open.
-
-/**
- * Visibility of the server. Public servers advertise, where private servers
- * do not.
- */
-static const StringID _server_visibility_dropdown[] = {
-	STR_NETWORK_SERVER_VISIBILITY_PRIVATE,
-	STR_NETWORK_SERVER_VISIBILITY_PUBLIC,
-	INVALID_STRING_ID
-};
 
 /**
  * Update the network new window because a new server is
@@ -75,6 +69,17 @@ static const StringID _server_visibility_dropdown[] = {
 void UpdateNetworkGameWindow()
 {
 	InvalidateWindowData(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_GAME, 0);
+}
+
+static DropDownList BuildVisibilityDropDownList()
+{
+	DropDownList list;
+
+	list.emplace_back(new DropDownListStringItem(STR_NETWORK_SERVER_VISIBILITY_LOCAL, SERVER_GAME_TYPE_LOCAL, false));
+	list.emplace_back(new DropDownListStringItem(STR_NETWORK_SERVER_VISIBILITY_INVITE_ONLY, SERVER_GAME_TYPE_INVITE_ONLY, false));
+	list.emplace_back(new DropDownListStringItem(STR_NETWORK_SERVER_VISIBILITY_PUBLIC, SERVER_GAME_TYPE_PUBLIC, false));
+
+	return list;
 }
 
 typedef GUIList<NetworkGameList*, StringFilter&> GUIGameServerList;
@@ -100,8 +105,7 @@ public:
 
 		leaf = new NWidgetLeaf(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NG_INFO, STR_EMPTY, STR_NETWORK_SERVER_LIST_INFO_ICONS_TOOLTIP);
 		leaf->SetMinimalSize(14 + GetSpriteSize(SPR_LOCK, nullptr, ZOOM_LVL_OUT_4X).width
-		                        + GetSpriteSize(SPR_BLOT, nullptr, ZOOM_LVL_OUT_4X).width
-		                        + GetSpriteSize(SPR_FLAGS_BASE, nullptr, ZOOM_LVL_OUT_4X).width, 12);
+		                        + GetSpriteSize(SPR_BLOT, nullptr, ZOOM_LVL_OUT_4X).width, 12);
 		leaf->SetFill(0, 1);
 		this->Add(leaf);
 
@@ -124,7 +128,7 @@ public:
 		/* First initialise some variables... */
 		for (NWidgetBase *child_wid = this->head; child_wid != nullptr; child_wid = child_wid->next) {
 			child_wid->SetupSmallestSize(w, init_array);
-			this->smallest_y = std::max(this->smallest_y, child_wid->smallest_y + child_wid->padding_top + child_wid->padding_bottom);
+			this->smallest_y = std::max(this->smallest_y, child_wid->smallest_y + child_wid->padding.Vertical());
 		}
 
 		/* ... then in a second pass make sure the 'current' sizes are set. Won't change for most widgets. */
@@ -220,14 +224,15 @@ protected:
 	static GUIGameServerList::SortFunction * const sorter_funcs[];
 	static GUIGameServerList::FilterFunction * const filter_funcs[];
 
-	NetworkGameList *server;      ///< selected server
-	NetworkGameList *last_joined; ///< the last joined server
-	GUIGameServerList servers;    ///< list with game servers.
-	ServerListPosition list_pos;  ///< position of the selected server
-	Scrollbar *vscroll;           ///< vertical scrollbar of the list of servers
-	QueryString name_editbox;     ///< Client name editbox.
-	QueryString filter_editbox;   ///< Editbox for filter on servers
-	GUITimer requery_timer;       ///< Timer for network requery
+	NetworkGameList *server;        ///< Selected server.
+	NetworkGameList *last_joined;   ///< The last joined server.
+	GUIGameServerList servers;      ///< List with game servers.
+	ServerListPosition list_pos;    ///< Position of the selected server.
+	Scrollbar *vscroll;             ///< Vertical scrollbar of the list of servers.
+	QueryString name_editbox;       ///< Client name editbox.
+	QueryString filter_editbox;     ///< Editbox for filter on servers.
+	GUITimer requery_timer;         ///< Timer for network requery.
+	bool searched_internet = false; ///< Did we ever press "Search Internet" button?
 
 	int lock_offset; ///< Left offset for lock icon.
 	int blot_offset; ///< Left offset for green/yellow/red compatibility icon.
@@ -245,8 +250,24 @@ protected:
 		/* Create temporary array of games to use for listing */
 		this->servers.clear();
 
+		bool found_current_server = false;
+		bool found_last_joined = false;
 		for (NetworkGameList *ngl = _network_game_list; ngl != nullptr; ngl = ngl->next) {
 			this->servers.push_back(ngl);
+			if (ngl == this->server) {
+				found_current_server = true;
+			}
+			if (ngl == this->last_joined) {
+				found_last_joined = true;
+			}
+		}
+		/* A refresh can cause the current server to be delete; so unselect. */
+		if (!found_last_joined) {
+			this->last_joined = nullptr;
+		}
+		if (!found_current_server) {
+			this->server = nullptr;
+			this->list_pos = SLP_INVALID;
 		}
 
 		/* Apply the filter condition immediately, if a search string has been provided. */
@@ -272,8 +293,10 @@ protected:
 	/** Sort servers by name. */
 	static bool NGameNameSorter(NetworkGameList * const &a, NetworkGameList * const &b)
 	{
-		int r = strnatcmp(a->info.server_name, b->info.server_name, true); // Sort by name (natural sorting).
-		return r == 0 ? a->address.CompareTo(b->address) < 0: r < 0;
+		int r = strnatcmp(a->info.server_name.c_str(), b->info.server_name.c_str(), true); // Sort by name (natural sorting).
+		if (r == 0) r = a->connection_string.compare(b->connection_string);
+
+		return r < 0;
 	}
 
 	/**
@@ -323,7 +346,7 @@ protected:
 	static bool NGameAllowedSorter(NetworkGameList * const &a, NetworkGameList * const &b)
 	{
 		/* The servers we do not know anything about (the ones that did not reply) should be at the bottom) */
-		int r = StrEmpty(a->info.server_revision) - StrEmpty(b->info.server_revision);
+		int r = a->info.server_revision.empty() - b->info.server_revision.empty();
 
 		/* Reverse default as we are interested in version-compatible clients first */
 		if (r == 0) r = b->info.version_compatible - a->info.version_compatible;
@@ -360,7 +383,7 @@ protected:
 		assert((*item) != nullptr);
 
 		sf.ResetState();
-		sf.AddLine((*item)->info.server_name);
+		sf.AddLine((*item)->info.server_name.c_str());
 		return sf.GetState();
 	}
 
@@ -370,66 +393,71 @@ protected:
 	 * @param y         from where to draw?
 	 * @param highlight does the line need to be highlighted?
 	 */
-	void DrawServerLine(const NetworkGameList *cur_item, uint y, bool highlight) const
+	void DrawServerLine(const NetworkGameList *cur_item, int y, bool highlight) const
 	{
-		const NWidgetBase *nwi_name = this->GetWidget<NWidgetBase>(WID_NG_NAME);
-		const NWidgetBase *nwi_info = this->GetWidget<NWidgetBase>(WID_NG_INFO);
+		Rect name = this->GetWidget<NWidgetBase>(WID_NG_NAME)->GetCurrentRect();
+		Rect info = this->GetWidget<NWidgetBase>(WID_NG_INFO)->GetCurrentRect();
 
 		/* show highlighted item with a different colour */
-		if (highlight) GfxFillRect(nwi_name->pos_x + 1, y + 1, nwi_info->pos_x + nwi_info->current_x - 2, y + this->resize.step_height - 2, PC_GREY);
+		if (highlight) {
+			Rect r = {name.left, y, info.right, y + (int)this->resize.step_height - 1};
+			Rect ir = r.Shrink(WidgetDimensions::scaled.bevel);
+			GfxFillRect(ir.left, ir.top, ir.right, ir.bottom, PC_GREY);
+		}
 
 		/* offsets to vertically centre text and icons */
 		int text_y_offset = (this->resize.step_height - FONT_HEIGHT_NORMAL) / 2 + 1;
 		int icon_y_offset = (this->resize.step_height - GetSpriteSize(SPR_BLOT).height) / 2;
 		int lock_y_offset = (this->resize.step_height - GetSpriteSize(SPR_LOCK).height) / 2;
 
-		DrawString(nwi_name->pos_x + WD_FRAMERECT_LEFT, nwi_name->pos_x + nwi_name->current_x - WD_FRAMERECT_RIGHT, y + text_y_offset, cur_item->info.server_name, TC_BLACK);
+		name = name.Shrink(WidgetDimensions::scaled.framerect);
+		DrawString(name.left, name.right, y + text_y_offset, cur_item->info.server_name, TC_BLACK);
 
 		/* only draw details if the server is online */
-		if (cur_item->online) {
+		if (cur_item->status == NGLS_ONLINE) {
 			const NWidgetServerListHeader *nwi_header = this->GetWidget<NWidgetServerListHeader>(WID_NG_HEADER);
 
 			if (nwi_header->IsWidgetVisible(WID_NG_CLIENTS)) {
-				const NWidgetBase *nwi_clients = this->GetWidget<NWidgetBase>(WID_NG_CLIENTS);
+				Rect clients = this->GetWidget<NWidgetBase>(WID_NG_CLIENTS)->GetCurrentRect();
 				SetDParam(0, cur_item->info.clients_on);
 				SetDParam(1, cur_item->info.clients_max);
 				SetDParam(2, cur_item->info.companies_on);
 				SetDParam(3, cur_item->info.companies_max);
-				DrawString(nwi_clients->pos_x, nwi_clients->pos_x + nwi_clients->current_x - 1, y + text_y_offset, STR_NETWORK_SERVER_LIST_GENERAL_ONLINE, TC_FROMSTRING, SA_HOR_CENTER);
+				DrawString(clients.left, clients.right, y + text_y_offset, STR_NETWORK_SERVER_LIST_GENERAL_ONLINE, TC_FROMSTRING, SA_HOR_CENTER);
 			}
 
 			if (nwi_header->IsWidgetVisible(WID_NG_MAPSIZE)) {
 				/* map size */
-				const NWidgetBase *nwi_mapsize = this->GetWidget<NWidgetBase>(WID_NG_MAPSIZE);
+				Rect mapsize = this->GetWidget<NWidgetBase>(WID_NG_MAPSIZE)->GetCurrentRect();
 				SetDParam(0, cur_item->info.map_width);
 				SetDParam(1, cur_item->info.map_height);
-				DrawString(nwi_mapsize->pos_x, nwi_mapsize->pos_x + nwi_mapsize->current_x - 1, y + text_y_offset, STR_NETWORK_SERVER_LIST_MAP_SIZE_SHORT, TC_FROMSTRING, SA_HOR_CENTER);
+				DrawString(mapsize.left, mapsize.right, y + text_y_offset, STR_NETWORK_SERVER_LIST_MAP_SIZE_SHORT, TC_FROMSTRING, SA_HOR_CENTER);
 			}
 
 			if (nwi_header->IsWidgetVisible(WID_NG_DATE)) {
 				/* current date */
-				const NWidgetBase *nwi_date = this->GetWidget<NWidgetBase>(WID_NG_DATE);
+				Rect date = this->GetWidget<NWidgetBase>(WID_NG_DATE)->GetCurrentRect();
 				YearMonthDay ymd;
 				ConvertDateToYMD(cur_item->info.game_date, &ymd);
 				SetDParam(0, ymd.year);
-				DrawString(nwi_date->pos_x, nwi_date->pos_x + nwi_date->current_x - 1, y + text_y_offset, STR_JUST_INT, TC_BLACK, SA_HOR_CENTER);
+				DrawString(date.left, date.right, y + text_y_offset, STR_JUST_INT, TC_BLACK, SA_HOR_CENTER);
 			}
 
 			if (nwi_header->IsWidgetVisible(WID_NG_YEARS)) {
 				/* number of years the game is running */
-				const NWidgetBase *nwi_years = this->GetWidget<NWidgetBase>(WID_NG_YEARS);
+				Rect years = this->GetWidget<NWidgetBase>(WID_NG_YEARS)->GetCurrentRect();
 				YearMonthDay ymd_cur, ymd_start;
 				ConvertDateToYMD(cur_item->info.game_date, &ymd_cur);
 				ConvertDateToYMD(cur_item->info.start_date, &ymd_start);
 				SetDParam(0, ymd_cur.year - ymd_start.year);
-				DrawString(nwi_years->pos_x, nwi_years->pos_x + nwi_years->current_x - 1, y + text_y_offset, STR_JUST_INT, TC_BLACK, SA_HOR_CENTER);
+				DrawString(years.left, years.right, y + text_y_offset, STR_JUST_INT, TC_BLACK, SA_HOR_CENTER);
 			}
 
 			/* draw a lock if the server is password protected */
-			if (cur_item->info.use_password) DrawSprite(SPR_LOCK, PAL_NONE, nwi_info->pos_x + this->lock_offset, y + lock_y_offset);
+			if (cur_item->info.use_password) DrawSprite(SPR_LOCK, PAL_NONE, info.left + this->lock_offset, y + lock_y_offset);
 
 			/* draw red or green icon, depending on compatibility with server */
-			DrawSprite(SPR_BLOT, (cur_item->info.compatible ? PALETTE_TO_GREEN : (cur_item->info.version_compatible ? PALETTE_TO_YELLOW : PALETTE_TO_RED)), nwi_info->pos_x + this->blot_offset, y + icon_y_offset + 1);
+			DrawSprite(SPR_BLOT, (cur_item->info.compatible ? PALETTE_TO_GREEN : (cur_item->info.version_compatible ? PALETTE_TO_YELLOW : PALETTE_TO_RED)), info.left + this->blot_offset, y + icon_y_offset + 1);
 		}
 	}
 
@@ -452,22 +480,18 @@ public:
 		this->list_pos = SLP_INVALID;
 		this->server = nullptr;
 
-		this->lock_offset = 5;
-		this->blot_offset = this->lock_offset + 3 + GetSpriteSize(SPR_LOCK).width;
-		this->flag_offset = this->blot_offset + 2 + GetSpriteSize(SPR_BLOT).width;
-
 		this->CreateNestedTree();
 		this->vscroll = this->GetScrollbar(WID_NG_SCROLLBAR);
 		this->FinishInitNested(WN_NETWORK_WINDOW_GAME);
 
 		this->querystrings[WID_NG_CLIENT] = &this->name_editbox;
-		this->name_editbox.text.Assign(_settings_client.network.client_name);
+		this->name_editbox.text.Assign(_settings_client.network.client_name.c_str());
 
 		this->querystrings[WID_NG_FILTER] = &this->filter_editbox;
 		this->filter_editbox.cancel_button = QueryString::ACTION_CLEAR;
 		this->SetFocusedWidget(WID_NG_FILTER);
 
-		/* As the master-server doesn't support "websocket" servers yet, we
+		/* As the Game Coordinator doesn't support "websocket" servers yet, we
 		 * let "os/emscripten/pre.js" hardcode a list of servers people can
 		 * join. This means the serverlist is curated for now, but it is the
 		 * best we can offer. */
@@ -475,10 +499,10 @@ public:
 		EM_ASM(if (window["openttd_server_list"]) openttd_server_list());
 #endif
 
-		this->last_joined = NetworkAddServer(_settings_client.network.last_joined);
+		this->last_joined = NetworkAddServer(_settings_client.network.last_joined, false);
 		this->server = this->last_joined;
 
-		this->requery_timer.SetInterval(MILLISECONDS_PER_TICK);
+		this->requery_timer.SetInterval(NETWORK_LIST_REFRESH_DELAY * 1000);
 
 		this->servers.SetListing(this->last_sorting);
 		this->servers.SetSortFuncs(this->sorter_funcs);
@@ -491,19 +515,24 @@ public:
 		this->last_sorting = this->servers.GetListing();
 	}
 
+	void OnInit() override
+	{
+		this->lock_offset = ScaleGUITrad(5);
+		this->blot_offset = this->lock_offset + ScaleGUITrad(3) + GetSpriteSize(SPR_LOCK).width;
+		this->flag_offset = this->blot_offset + ScaleGUITrad(2) + GetSpriteSize(SPR_BLOT).width;
+	}
+
 	void UpdateWidgetSize(int widget, Dimension *size, const Dimension &padding, Dimension *fill, Dimension *resize) override
 	{
 		switch (widget) {
 			case WID_NG_MATRIX:
-				resize->height = WD_MATRIX_TOP + std::max(GetSpriteSize(SPR_BLOT).height, (uint)FONT_HEIGHT_NORMAL) + WD_MATRIX_BOTTOM;
-				resize->height = GetMinButtonSize(resize->height);
+				resize->height = std::max(GetSpriteSize(SPR_BLOT).height, (uint)FONT_HEIGHT_NORMAL) + padding.height;
 				fill->height = resize->height;
 				size->height = 5 * resize->height;
 				break;
 
 			case WID_NG_LASTJOINED:
-				size->height = WD_MATRIX_TOP + std::max(GetSpriteSize(SPR_BLOT).height, (uint)FONT_HEIGHT_NORMAL) + WD_MATRIX_BOTTOM;
-				size->height = GetMinButtonSize(size->height);
+				size->height = std::max(GetSpriteSize(SPR_BLOT).height, (uint)FONT_HEIGHT_NORMAL) + WidgetDimensions::scaled.matrix.Vertical();
 				break;
 
 			case WID_NG_LASTJOINED_SPACER:
@@ -590,13 +619,15 @@ public:
 		this->SetWidgetDisabledState(WID_NG_REFRESH, sel == nullptr);
 		/* 'Join' button disabling conditions */
 		this->SetWidgetDisabledState(WID_NG_JOIN, sel == nullptr || // no Selected Server
-				!sel->online || // Server offline
+				sel->status != NGLS_ONLINE || // Server offline
 				sel->info.clients_on >= sel->info.clients_max || // Server full
 				!sel->info.compatible); // Revision mismatch
 
+		this->SetWidgetLoweredState(WID_NG_REFRESH, sel != nullptr && sel->refreshing);
+
 		/* 'NewGRF Settings' button invisible if no NewGRF is used */
-		this->GetWidget<NWidgetStacked>(WID_NG_NEWGRF_SEL)->SetDisplayedPlane(sel == nullptr || !sel->online || sel->info.grfconfig == nullptr);
-		this->GetWidget<NWidgetStacked>(WID_NG_NEWGRF_MISSING_SEL)->SetDisplayedPlane(sel == nullptr || !sel->online || sel->info.grfconfig == nullptr || !sel->info.version_compatible || sel->info.compatible);
+		this->GetWidget<NWidgetStacked>(WID_NG_NEWGRF_SEL)->SetDisplayedPlane(sel == nullptr || sel->status != NGLS_ONLINE || sel->info.grfconfig == nullptr);
+		this->GetWidget<NWidgetStacked>(WID_NG_NEWGRF_MISSING_SEL)->SetDisplayedPlane(sel == nullptr || sel->status != NGLS_ONLINE || sel->info.grfconfig == nullptr || !sel->info.version_compatible || sel->info.compatible);
 
 		this->DrawWidgets();
 	}
@@ -605,65 +636,86 @@ public:
 	{
 		NetworkGameList *sel = this->server;
 
-		const int detail_height = 6 + 8 + 6 + 3 * FONT_HEIGHT_NORMAL;
+		/* Height for the title banner */
+		int HEADER_HEIGHT = 3 * FONT_HEIGHT_NORMAL + WidgetDimensions::scaled.frametext.Vertical();
+
+		Rect hr = r.WithHeight(HEADER_HEIGHT).Shrink(WidgetDimensions::scaled.frametext);
+		Rect tr = r.Shrink(WidgetDimensions::scaled.frametext);
+		tr.top += HEADER_HEIGHT;
 
 		/* Draw the right menu */
-		GfxFillRect(r.left + 1, r.top + 1, r.right - 1, r.top + detail_height - 1, PC_DARK_BLUE);
+		/* Create the nice grayish rectangle at the details top */
+		GfxFillRect(r.WithHeight(HEADER_HEIGHT).Shrink(WidgetDimensions::scaled.bevel.left, WidgetDimensions::scaled.bevel.top, WidgetDimensions::scaled.bevel.right, 0), PC_DARK_BLUE);
 		if (sel == nullptr) {
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, r.top + 6 + 4 + FONT_HEIGHT_NORMAL, STR_NETWORK_SERVER_LIST_GAME_INFO, TC_FROMSTRING, SA_HOR_CENTER);
-		} else if (!sel->online) {
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, r.top + 6 + 4 + FONT_HEIGHT_NORMAL, sel->info.server_name, TC_ORANGE, SA_HOR_CENTER); // game name
+			DrawString(hr.left, hr.right, hr.top, STR_NETWORK_SERVER_LIST_GAME_INFO, TC_FROMSTRING, SA_HOR_CENTER);
+		} else if (sel->status != NGLS_ONLINE) {
+			StringID message = INVALID_STRING_ID;
+			switch (sel->status) {
+				case NGLS_OFFLINE: message = STR_NETWORK_SERVER_LIST_SERVER_OFFLINE; break;
+				case NGLS_FULL: message = STR_NETWORK_SERVER_LIST_SERVER_FULL; break;
+				case NGLS_BANNED: message = STR_NETWORK_SERVER_LIST_SERVER_BANNED; break;
+				case NGLS_TOO_OLD: message = STR_NETWORK_SERVER_LIST_SERVER_TOO_OLD; break;
 
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, r.top + detail_height + 4, STR_NETWORK_SERVER_LIST_SERVER_OFFLINE, TC_FROMSTRING, SA_HOR_CENTER); // server offline
+				/* Handled by the if-case above. */
+				case NGLS_ONLINE: NOT_REACHED();
+			}
+
+			DrawString(hr.left, hr.right, hr.top, message, TC_FROMSTRING, SA_HOR_CENTER); // server offline
+			DrawStringMultiLine(hr.left, hr.right, hr.top + FONT_HEIGHT_NORMAL, hr.bottom, sel->info.server_name, TC_ORANGE, SA_HOR_CENTER); // game name
+			DrawString(tr.left, tr.right, tr.top, message, TC_FROMSTRING, SA_HOR_CENTER); // server offline
 		} else { // show game info
 
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, r.top + 6, STR_NETWORK_SERVER_LIST_GAME_INFO, TC_FROMSTRING, SA_HOR_CENTER);
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, r.top + 6 + 4 + FONT_HEIGHT_NORMAL, sel->info.server_name, TC_ORANGE, SA_HOR_CENTER); // game name
-
-			uint16 y = r.top + detail_height + 4;
+			DrawString(hr.left, hr.right, hr.top, STR_NETWORK_SERVER_LIST_GAME_INFO, TC_FROMSTRING, SA_HOR_CENTER);
+			DrawStringMultiLine(hr.left, hr.right, hr.top + FONT_HEIGHT_NORMAL, hr.bottom, sel->info.server_name, TC_ORANGE, SA_HOR_CENTER); // game name
 
 			SetDParam(0, sel->info.clients_on);
 			SetDParam(1, sel->info.clients_max);
 			SetDParam(2, sel->info.companies_on);
 			SetDParam(3, sel->info.companies_max);
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_SERVER_LIST_CLIENTS);
-			y += FONT_HEIGHT_NORMAL;
+			DrawString(tr, STR_NETWORK_SERVER_LIST_CLIENTS);
+			tr.top += FONT_HEIGHT_NORMAL;
 
-			SetDParam(0, STR_CHEAT_SWITCH_CLIMATE_TEMPERATE_LANDSCAPE + sel->info.map_set);
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_SERVER_LIST_LANDSCAPE); // landscape
-			y += FONT_HEIGHT_NORMAL;
+			SetDParam(0, STR_CLIMATE_TEMPERATE_LANDSCAPE + sel->info.landscape);
+			DrawString(tr, STR_NETWORK_SERVER_LIST_LANDSCAPE); // landscape
+			tr.top += FONT_HEIGHT_NORMAL;
 
 			SetDParam(0, sel->info.map_width);
 			SetDParam(1, sel->info.map_height);
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_SERVER_LIST_MAP_SIZE); // map size
-			y += FONT_HEIGHT_NORMAL;
+			DrawString(tr, STR_NETWORK_SERVER_LIST_MAP_SIZE); // map size
+			tr.top += FONT_HEIGHT_NORMAL;
 
 			SetDParamStr(0, sel->info.server_revision);
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_SERVER_LIST_SERVER_VERSION); // server version
-			y += FONT_HEIGHT_NORMAL;
+			DrawString(tr, STR_NETWORK_SERVER_LIST_SERVER_VERSION); // server version
+			tr.top += FONT_HEIGHT_NORMAL;
 
-			std::string address = sel->address.GetAddressAsString();
-			SetDParamStr(0, address.c_str());
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_SERVER_LIST_SERVER_ADDRESS); // server address
-			y += FONT_HEIGHT_NORMAL;
+			SetDParamStr(0, sel->connection_string);
+			StringID invite_or_address = StrStartsWith(sel->connection_string, "+") ? STR_NETWORK_SERVER_LIST_INVITE_CODE : STR_NETWORK_SERVER_LIST_SERVER_ADDRESS;
+			DrawString(tr, invite_or_address); // server address / invite code
+			tr.top += FONT_HEIGHT_NORMAL;
 
 			SetDParam(0, sel->info.start_date);
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_SERVER_LIST_START_DATE); // start date
-			y += FONT_HEIGHT_NORMAL;
+			DrawString(tr, STR_NETWORK_SERVER_LIST_START_DATE); // start date
+			tr.top += FONT_HEIGHT_NORMAL;
 
 			SetDParam(0, sel->info.game_date);
-			DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_SERVER_LIST_CURRENT_DATE); // current date
-			y += FONT_HEIGHT_NORMAL;
+			DrawString(tr, STR_NETWORK_SERVER_LIST_CURRENT_DATE); // current date
+			tr.top += FONT_HEIGHT_NORMAL;
 
-			y += WD_PAR_VSEP_NORMAL;
+			if (sel->info.gamescript_version != -1) {
+				SetDParamStr(0, sel->info.gamescript_name);
+				SetDParam(1, sel->info.gamescript_version);
+				tr.top = DrawStringMultiLine(tr, STR_NETWORK_SERVER_LIST_GAMESCRIPT); // gamescript name and version
+			}
+
+			tr.top += WidgetDimensions::scaled.vsep_wide;
 
 			if (!sel->info.compatible) {
-				DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, sel->info.version_compatible ? STR_NETWORK_SERVER_LIST_GRF_MISMATCH : STR_NETWORK_SERVER_LIST_VERSION_MISMATCH, TC_FROMSTRING, SA_HOR_CENTER); // server mismatch
+				DrawString(tr, sel->info.version_compatible ? STR_NETWORK_SERVER_LIST_GRF_MISMATCH : STR_NETWORK_SERVER_LIST_VERSION_MISMATCH, TC_FROMSTRING, SA_HOR_CENTER); // server mismatch
 			} else if (sel->info.clients_on == sel->info.clients_max) {
 				/* Show: server full, when clients_on == max_clients */
-				DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_SERVER_LIST_SERVER_FULL, TC_FROMSTRING, SA_HOR_CENTER); // server full
+				DrawString(tr, STR_NETWORK_SERVER_LIST_SERVER_FULL, TC_FROMSTRING, SA_HOR_CENTER); // server full
 			} else if (sel->info.use_password) {
-				DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_SERVER_LIST_PASSWORD, TC_FROMSTRING, SA_HOR_CENTER); // password warning
+				DrawString(tr, STR_NETWORK_SERVER_LIST_PASSWORD, TC_FROMSTRING, SA_HOR_CENTER); // password warning
 			}
 		}
 	}
@@ -672,7 +724,7 @@ public:
 	{
 		switch (widget) {
 			case WID_NG_CANCEL: // Cancel button
-				DeleteWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_GAME);
+				CloseWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_GAME);
 				break;
 
 			case WID_NG_NAME:    // Sort by name
@@ -720,7 +772,8 @@ public:
 			}
 
 			case WID_NG_SEARCH_INTERNET:
-				NetworkUDPQueryMasterServer();
+				_network_coordinator_client.GetListing();
+				this->searched_internet = true;
 				break;
 
 			case WID_NG_SEARCH_LAN:
@@ -731,7 +784,7 @@ public:
 				SetDParamStr(0, _settings_client.network.connect_to_ip);
 				ShowQueryString(
 					STR_JUST_RAW_STRING,
-					STR_NETWORK_SERVER_LIST_ENTER_IP,
+					STR_NETWORK_SERVER_LIST_ENTER_SERVER_ADDRESS,
 					NETWORK_HOSTNAME_PORT_LENGTH,  // maximum number of characters including '\0'
 					this, CS_ALPHANUMERAL, QSF_ACCEPT_UNCHANGED);
 				break;
@@ -742,12 +795,12 @@ public:
 
 			case WID_NG_JOIN: // Join Game
 				if (this->server != nullptr) {
-					ShowNetworkLobbyWindow(this->server);
+					NetworkClientConnectGame(this->server->connection_string, COMPANY_SPECTATOR);
 				}
 				break;
 
 			case WID_NG_REFRESH: // Refresh
-				if (this->server != nullptr) NetworkTCPQueryServer(this->server->address);
+				if (this->server != nullptr && !this->server->refreshing) NetworkQueryServer(this->server->connection_string);
 				break;
 
 			case WID_NG_NEWGRF: // NewGRF Settings
@@ -815,7 +868,7 @@ public:
 			case WID_NG_CLIENT:
 				/* Validation of the name will happen once the user tries to join or start a game, as getting
 				 * error messages while typing (e.g. when you clear the name) defeats the purpose of the check. */
-				strecpy(_settings_client.network.client_name, this->name_editbox.text.buf, lastof(_settings_client.network.client_name));
+				_settings_client.network.client_name = this->name_editbox.text.buf;
 				break;
 		}
 	}
@@ -823,8 +876,9 @@ public:
 	void OnQueryTextFinished(char *str) override
 	{
 		if (!StrEmpty(str)) {
-			strecpy(_settings_client.network.connect_to_ip, str, lastof(_settings_client.network.connect_to_ip));
+			_settings_client.network.connect_to_ip = str;
 			NetworkAddServer(str);
+			NetworkRebuildHostList();
 		}
 	}
 
@@ -835,10 +889,11 @@ public:
 
 	void OnRealtimeTick(uint delta_ms) override
 	{
+		if (!this->searched_internet) return;
 		if (!this->requery_timer.Elapsed(delta_ms)) return;
-		this->requery_timer.SetInterval(MILLISECONDS_PER_TICK);
+		this->requery_timer.SetInterval(NETWORK_LIST_REFRESH_DELAY * 1000);
 
-		NetworkGameListRequery();
+		_network_coordinator_client.GetListing();
 	}
 };
 
@@ -907,7 +962,7 @@ static const NWidgetPart _nested_network_game_widgets[] = {
 					EndContainer(),
 					NWidget(WWT_PANEL, COLOUR_LIGHT_BLUE, WID_NG_DETAILS),
 						NWidget(NWID_VERTICAL, NC_EQUALSIZE), SetPIP(5, 5, 5),
-							NWidget(WWT_EMPTY, INVALID_COLOUR, WID_NG_DETAILS_SPACER), SetMinimalSize(140, 0), SetMinimalTextLines(15, 24 + WD_PAR_VSEP_NORMAL), SetResize(0, 1), SetFill(1, 1), // Make sure it's at least this wide
+							NWidget(WWT_EMPTY, INVALID_COLOUR, WID_NG_DETAILS_SPACER), SetMinimalSize(140, 0), SetMinimalTextLines(15, 24 + WidgetDimensions::unscaled.vsep_normal), SetResize(0, 1), SetFill(1, 1), // Make sure it's at least this wide
 							NWidget(NWID_HORIZONTAL, NC_NONE), SetPIP(5, 5, 5),
 								NWidget(NWID_SELECTION, INVALID_COLOUR, WID_NG_NEWGRF_MISSING_SEL),
 									NWidget(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NG_NEWGRF_MISSING), SetFill(1, 0), SetDataTip(STR_NEWGRF_SETTINGS_FIND_MISSING_CONTENT_BUTTON, STR_NEWGRF_SETTINGS_FIND_MISSING_CONTENT_TOOLTIP),
@@ -960,8 +1015,7 @@ static WindowDesc _network_game_window_desc(
 void ShowNetworkGameWindow()
 {
 	static bool first = true;
-	DeleteWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_LOBBY);
-	DeleteWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_START);
+	CloseWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_START);
 
 	/* Only show once */
 	if (first) {
@@ -984,7 +1038,7 @@ struct NetworkStartServerWindow : public Window {
 		this->InitNested(WN_NETWORK_WINDOW_START);
 
 		this->querystrings[WID_NSS_GAMENAME] = &this->name_editbox;
-		this->name_editbox.text.Assign(_settings_client.network.server_name);
+		this->name_editbox.text.Assign(_settings_client.network.server_name.c_str());
 
 		this->SetFocusedWidget(WID_NSS_GAMENAME);
 	}
@@ -993,7 +1047,7 @@ struct NetworkStartServerWindow : public Window {
 	{
 		switch (widget) {
 			case WID_NSS_CONNTYPE_BTN:
-				SetDParam(0, _server_visibility_dropdown[_settings_client.network.server_advertise]);
+				SetDParam(0, STR_NETWORK_SERVER_VISIBILITY_LOCAL + _settings_client.network.server_game_type);
 				break;
 
 			case WID_NSS_CLIENTS_TXT:
@@ -1003,10 +1057,6 @@ struct NetworkStartServerWindow : public Window {
 			case WID_NSS_COMPANIES_TXT:
 				SetDParam(0, _settings_client.network.max_companies);
 				break;
-
-			case WID_NSS_SPECTATORS_TXT:
-				SetDParam(0, _settings_client.network.max_spectators);
-				break;
 		}
 	}
 
@@ -1014,11 +1064,9 @@ struct NetworkStartServerWindow : public Window {
 	{
 		switch (widget) {
 			case WID_NSS_CONNTYPE_BTN:
-				*size = maxdim(GetStringBoundingBox(_server_visibility_dropdown[0]), GetStringBoundingBox(_server_visibility_dropdown[1]));
+				*size = maxdim(maxdim(GetStringBoundingBox(STR_NETWORK_SERVER_VISIBILITY_LOCAL), GetStringBoundingBox(STR_NETWORK_SERVER_VISIBILITY_PUBLIC)), GetStringBoundingBox(STR_NETWORK_SERVER_VISIBILITY_INVITE_ONLY));
 				size->width += padding.width;
-				size->width = GetMinButtonSize(size->width);
 				size->height += padding.height;
-				size->height = GetMinButtonSize(size->height);
 				break;
 		}
 	}
@@ -1028,7 +1076,7 @@ struct NetworkStartServerWindow : public Window {
 		switch (widget) {
 			case WID_NSS_SETPWD:
 				/* If password is set, draw red '*' next to 'Set password' button. */
-				if (!StrEmpty(_settings_client.network.server_password)) DrawString(r.right + WD_FRAMERECT_LEFT, this->width - WD_FRAMERECT_RIGHT, r.top, "*", TC_RED);
+				if (!_settings_client.network.server_password.empty()) DrawString(r.right + WidgetDimensions::scaled.framerect.left, this->width - WidgetDimensions::scaled.framerect.right, r.top, "*", TC_RED);
 		}
 	}
 
@@ -1046,12 +1094,11 @@ struct NetworkStartServerWindow : public Window {
 				break;
 
 			case WID_NSS_CONNTYPE_BTN: // Connection type
-				ShowDropDownMenu(this, _server_visibility_dropdown, _settings_client.network.server_advertise, WID_NSS_CONNTYPE_BTN, 0, 0); // do it for widget WID_NSS_CONNTYPE_BTN
+				ShowDropDownList(this, BuildVisibilityDropDownList(), _settings_client.network.server_game_type, WID_NSS_CONNTYPE_BTN);
 				break;
 
 			case WID_NSS_CLIENTS_BTND:    case WID_NSS_CLIENTS_BTNU:    // Click on up/down button for number of clients
 			case WID_NSS_COMPANIES_BTND:  case WID_NSS_COMPANIES_BTNU:  // Click on up/down button for number of companies
-			case WID_NSS_SPECTATORS_BTND: case WID_NSS_SPECTATORS_BTNU: // Click on up/down button for number of spectators
 				/* Don't allow too fast scrolling. */
 				if (!(this->flags & WF_TIMEOUT) || this->timeout_timer <= 1) {
 					this->HandleButtonClick(widget);
@@ -1063,9 +1110,6 @@ struct NetworkStartServerWindow : public Window {
 							break;
 						case WID_NSS_COMPANIES_BTND: case WID_NSS_COMPANIES_BTNU:
 							_settings_client.network.max_companies  = Clamp(_settings_client.network.max_companies  + widget - WID_NSS_COMPANIES_TXT,  1, MAX_COMPANIES);
-							break;
-						case WID_NSS_SPECTATORS_BTND: case WID_NSS_SPECTATORS_BTNU:
-							_settings_client.network.max_spectators = Clamp(_settings_client.network.max_spectators + widget - WID_NSS_SPECTATORS_TXT, 0, MAX_CLIENTS);
 							break;
 					}
 				}
@@ -1084,13 +1128,8 @@ struct NetworkStartServerWindow : public Window {
 				ShowQueryString(STR_JUST_INT, STR_NETWORK_START_SERVER_NUMBER_OF_COMPANIES,  3, this, CS_NUMERAL, QSF_NONE);
 				break;
 
-			case WID_NSS_SPECTATORS_TXT: // Click on number of spectators
-				this->widget_id = WID_NSS_SPECTATORS_TXT;
-				SetDParam(0, _settings_client.network.max_spectators);
-				ShowQueryString(STR_JUST_INT, STR_NETWORK_START_SERVER_NUMBER_OF_SPECTATORS, 4, this, CS_NUMERAL, QSF_NONE);
-				break;
-
 			case WID_NSS_GENERATE_GAME: // Start game
+				if (!CheckServerName()) return;
 				_is_network_server = true;
 				if (_ctrl_pressed) {
 					StartNewGameWithoutGUI(GENERATE_NEW_SEED);
@@ -1100,16 +1139,19 @@ struct NetworkStartServerWindow : public Window {
 				break;
 
 			case WID_NSS_LOAD_GAME:
+				if (!CheckServerName()) return;
 				_is_network_server = true;
 				ShowSaveLoadDialog(FT_SAVEGAME, SLO_LOAD);
 				break;
 
 			case WID_NSS_PLAY_SCENARIO:
+				if (!CheckServerName()) return;
 				_is_network_server = true;
 				ShowSaveLoadDialog(FT_SCENARIO, SLO_LOAD);
 				break;
 
 			case WID_NSS_PLAY_HEIGHTMAP:
+				if (!CheckServerName()) return;
 				_is_network_server = true;
 				ShowSaveLoadDialog(FT_HEIGHTMAP,SLO_LOAD);
 				break;
@@ -1120,7 +1162,7 @@ struct NetworkStartServerWindow : public Window {
 	{
 		switch (widget) {
 			case WID_NSS_CONNTYPE_BTN:
-				_settings_client.network.server_advertise = (index != 0);
+				_settings_client.network.server_game_type = (ServerGameType)index;
 				break;
 			default:
 				NOT_REACHED();
@@ -1129,16 +1171,18 @@ struct NetworkStartServerWindow : public Window {
 		this->SetDirty();
 	}
 
-	void OnEditboxChanged(int wid) override
+	bool CheckServerName()
 	{
-		if (wid == WID_NSS_GAMENAME) {
-			strecpy(_settings_client.network.server_name, this->name_editbox.text.buf, lastof(_settings_client.network.server_name));
-		}
+		std::string str = this->name_editbox.text.buf;
+		if (!NetworkValidateServerName(str)) return false;
+
+		SetSettingValue(GetSettingFromName("network.server_name")->AsStringSetting(), str);
+		return true;
 	}
 
 	void OnTimeout() override
 	{
-		static const int raise_widgets[] = {WID_NSS_CLIENTS_BTND, WID_NSS_CLIENTS_BTNU, WID_NSS_COMPANIES_BTND, WID_NSS_COMPANIES_BTNU, WID_NSS_SPECTATORS_BTND, WID_NSS_SPECTATORS_BTNU, WIDGET_LIST_END};
+		static const int raise_widgets[] = {WID_NSS_CLIENTS_BTND, WID_NSS_CLIENTS_BTNU, WID_NSS_COMPANIES_BTND, WID_NSS_COMPANIES_BTNU, WIDGET_LIST_END};
 		for (const int *widget = raise_widgets; *widget != WIDGET_LIST_END; widget++) {
 			if (this->IsWidgetLowered(*widget)) {
 				this->RaiseWidget(*widget);
@@ -1152,7 +1196,7 @@ struct NetworkStartServerWindow : public Window {
 		if (str == nullptr) return;
 
 		if (this->widget_id == WID_NSS_SETPWD) {
-			strecpy(_settings_client.network.server_password, str, lastof(_settings_client.network.server_password));
+			_settings_client.network.server_password = str;
 		} else {
 			int32 value = atoi(str);
 			this->SetWidgetDirty(this->widget_id);
@@ -1160,7 +1204,6 @@ struct NetworkStartServerWindow : public Window {
 				default: NOT_REACHED();
 				case WID_NSS_CLIENTS_TXT:    _settings_client.network.max_clients    = Clamp(value, 2, MAX_CLIENTS); break;
 				case WID_NSS_COMPANIES_TXT:  _settings_client.network.max_companies  = Clamp(value, 1, MAX_COMPANIES); break;
-				case WID_NSS_SPECTATORS_TXT: _settings_client.network.max_spectators = Clamp(value, 0, MAX_CLIENTS); break;
 			}
 		}
 
@@ -1190,7 +1233,7 @@ static const NWidgetPart _nested_network_start_server_window_widgets[] = {
 				EndContainer(),
 				NWidget(NWID_VERTICAL), SetPIP(0, 1, 0),
 					NWidget(NWID_SPACER), SetFill(1, 1),
-					NWidget(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NSS_SETPWD), SetSizingType(NWST_BUTTON), SetFill(1, 0), SetDataTip(STR_NETWORK_START_SERVER_SET_PASSWORD, STR_NETWORK_START_SERVER_PASSWORD_TOOLTIP),
+					NWidget(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NSS_SETPWD), SetFill(1, 0), SetDataTip(STR_NETWORK_START_SERVER_SET_PASSWORD, STR_NETWORK_START_SERVER_PASSWORD_TOOLTIP),
 				EndContainer(),
 			EndContainer(),
 
@@ -1210,15 +1253,6 @@ static const NWidgetPart _nested_network_start_server_window_widgets[] = {
 						NWidget(WWT_IMGBTN, COLOUR_LIGHT_BLUE, WID_NSS_COMPANIES_BTND), SetMinimalSize(12, 12), SetFill(0, 1), SetDataTip(SPR_ARROW_DOWN, STR_NETWORK_START_SERVER_NUMBER_OF_COMPANIES_TOOLTIP),
 						NWidget(WWT_PUSHTXTBTN, COLOUR_LIGHT_BLUE, WID_NSS_COMPANIES_TXT), SetFill(1, 0), SetDataTip(STR_NETWORK_START_SERVER_COMPANIES_SELECT, STR_NETWORK_START_SERVER_NUMBER_OF_COMPANIES_TOOLTIP),
 						NWidget(WWT_IMGBTN, COLOUR_LIGHT_BLUE, WID_NSS_COMPANIES_BTNU), SetMinimalSize(12, 12), SetFill(0, 1), SetDataTip(SPR_ARROW_UP, STR_NETWORK_START_SERVER_NUMBER_OF_COMPANIES_TOOLTIP),
-					EndContainer(),
-				EndContainer(),
-
-				NWidget(NWID_VERTICAL), SetPIP(0, 1, 0),
-					NWidget(WWT_TEXT, COLOUR_LIGHT_BLUE, WID_NSS_SPECTATORS_LABEL), SetFill(1, 0), SetDataTip(STR_NETWORK_START_SERVER_NUMBER_OF_SPECTATORS, STR_NULL),
-					NWidget(NWID_HORIZONTAL),
-						NWidget(WWT_IMGBTN, COLOUR_LIGHT_BLUE, WID_NSS_SPECTATORS_BTND), SetMinimalSize(12, 12), SetFill(0, 1), SetDataTip(SPR_ARROW_DOWN, STR_NETWORK_START_SERVER_NUMBER_OF_SPECTATORS_TOOLTIP),
-						NWidget(WWT_PUSHTXTBTN, COLOUR_LIGHT_BLUE, WID_NSS_SPECTATORS_TXT), SetFill(1, 0), SetDataTip(STR_NETWORK_START_SERVER_SPECTATORS_SELECT, STR_NETWORK_START_SERVER_NUMBER_OF_SPECTATORS_TOOLTIP),
-						NWidget(WWT_IMGBTN, COLOUR_LIGHT_BLUE, WID_NSS_SPECTATORS_BTNU), SetMinimalSize(12, 12), SetFill(0, 1), SetDataTip(SPR_ARROW_UP, STR_NETWORK_START_SERVER_NUMBER_OF_SPECTATORS_TOOLTIP),
 					EndContainer(),
 				EndContainer(),
 			EndContainer(),
@@ -1253,332 +1287,11 @@ static WindowDesc _network_start_server_window_desc(
 
 static void ShowNetworkStartServerWindow()
 {
-	if (!NetworkValidateClientName()) return;
+	if (!NetworkValidateOurClientName()) return;
 
-	DeleteWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_GAME);
-	DeleteWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_LOBBY);
+	CloseWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_GAME);
 
 	new NetworkStartServerWindow(&_network_start_server_window_desc);
-}
-
-struct NetworkLobbyWindow : public Window {
-	CompanyID company;       ///< Selected company
-	NetworkGameList *server; ///< Selected server
-	NetworkCompanyInfo company_info[MAX_COMPANIES];
-	Scrollbar *vscroll;
-
-	NetworkLobbyWindow(WindowDesc *desc, NetworkGameList *ngl) :
-			Window(desc), company(INVALID_COMPANY), server(ngl)
-	{
-		this->CreateNestedTree();
-		this->vscroll = this->GetScrollbar(WID_NL_SCROLLBAR);
-		this->FinishInitNested(WN_NETWORK_WINDOW_LOBBY);
-	}
-
-	CompanyID NetworkLobbyFindCompanyIndex(byte pos) const
-	{
-		/* Scroll through all this->company_info and get the 'pos' item that is not empty. */
-		for (CompanyID i = COMPANY_FIRST; i < MAX_COMPANIES; i++) {
-			if (!StrEmpty(this->company_info[i].company_name)) {
-				if (pos-- == 0) return i;
-			}
-		}
-
-		return COMPANY_FIRST;
-	}
-
-	void UpdateWidgetSize(int widget, Dimension *size, const Dimension &padding, Dimension *fill, Dimension *resize) override
-	{
-		switch (widget) {
-			case WID_NL_HEADER:
-				size->height = WD_MATRIX_TOP + FONT_HEIGHT_NORMAL + WD_MATRIX_BOTTOM;
-				break;
-
-			case WID_NL_MATRIX:
-				resize->height = WD_MATRIX_TOP + std::max<uint>(std::max(GetSpriteSize(SPR_LOCK).height, GetSpriteSize(SPR_PROFIT_LOT).height), FONT_HEIGHT_NORMAL) + WD_MATRIX_BOTTOM;
-				resize->height = GetMinButtonSize(resize->height);
-				size->height = 6 * resize->height;
-				break;
-
-			case WID_NL_DETAILS:
-				size->height = 30 + 11 * FONT_HEIGHT_NORMAL;
-				break;
-		}
-	}
-
-	void SetStringParameters(int widget) const override
-	{
-		switch (widget) {
-			case WID_NL_TEXT:
-				SetDParamStr(0, this->server->info.server_name);
-				break;
-		}
-	}
-
-	void DrawWidget(const Rect &r, int widget) const override
-	{
-		switch (widget) {
-			case WID_NL_DETAILS:
-				this->DrawDetails(r);
-				break;
-
-			case WID_NL_MATRIX:
-				this->DrawMatrix(r);
-				break;
-		}
-	}
-
-	void OnPaint() override
-	{
-		const NetworkGameInfo *gi = &this->server->info;
-
-		/* Join button is disabled when no company is selected and for AI companies. */
-		this->SetWidgetDisabledState(WID_NL_JOIN, this->company == INVALID_COMPANY || GetLobbyCompanyInfo(this->company)->ai);
-		/* Cannot start new company if there are too many. */
-		this->SetWidgetDisabledState(WID_NL_NEW, gi->companies_on >= gi->companies_max);
-		/* Cannot spectate if there are too many spectators. */
-		this->SetWidgetDisabledState(WID_NL_SPECTATE, gi->spectators_on >= gi->spectators_max);
-
-		this->vscroll->SetCount(gi->companies_on);
-
-		/* Draw window widgets */
-		this->DrawWidgets();
-	}
-
-	void DrawMatrix(const Rect &r) const
-	{
-		bool rtl = _current_text_dir == TD_RTL;
-		uint left = r.left + WD_FRAMERECT_LEFT;
-		uint right = r.right - WD_FRAMERECT_RIGHT;
-		uint text_offset = (this->resize.step_height - WD_MATRIX_TOP - WD_MATRIX_BOTTOM - FONT_HEIGHT_NORMAL) / 2 + WD_MATRIX_TOP;
-
-		Dimension lock_size = GetSpriteSize(SPR_LOCK);
-		int lock_width      = lock_size.width;
-		int lock_y_offset   = (this->resize.step_height - WD_MATRIX_TOP - WD_MATRIX_BOTTOM - lock_size.height) / 2 + WD_MATRIX_TOP;
-
-		Dimension profit_size = GetSpriteSize(SPR_PROFIT_LOT);
-		int profit_width      = lock_size.width;
-		int profit_y_offset   = (this->resize.step_height - WD_MATRIX_TOP - WD_MATRIX_BOTTOM - profit_size.height) / 2 + WD_MATRIX_TOP;
-
-		uint text_left   = left  + (rtl ? lock_width + profit_width + 4 : 0);
-		uint text_right  = right - (rtl ? 0 : lock_width + profit_width + 4);
-		uint profit_left = rtl ? left : right - profit_width;
-		uint lock_left   = rtl ? left + profit_width + 2 : right - profit_width - lock_width - 2;
-
-		int y = r.top;
-		/* Draw company list */
-		int pos = this->vscroll->GetPosition();
-		while (pos < this->server->info.companies_on) {
-			byte company = NetworkLobbyFindCompanyIndex(pos);
-			bool income = false;
-			if (this->company == company) {
-				GfxFillRect(r.left + WD_BEVEL_LEFT, y + 1, r.right - WD_BEVEL_RIGHT, y + this->resize.step_height - 2, PC_GREY);  // show highlighted item with a different colour
-			}
-
-			DrawString(text_left, text_right, y + text_offset, this->company_info[company].company_name, TC_BLACK);
-			if (this->company_info[company].use_password != 0) DrawSprite(SPR_LOCK, PAL_NONE, lock_left, y + lock_y_offset);
-
-			/* If the company's income was positive puts a green dot else a red dot */
-			if (this->company_info[company].income >= 0) income = true;
-			DrawSprite(income ? SPR_PROFIT_LOT : SPR_PROFIT_NEGATIVE, PAL_NONE, profit_left, y + profit_y_offset);
-
-			pos++;
-			y += this->resize.step_height;
-			if (pos >= this->vscroll->GetPosition() + this->vscroll->GetCapacity()) break;
-		}
-	}
-
-	void DrawDetails(const Rect &r) const
-	{
-		const int detail_height = 12 + FONT_HEIGHT_NORMAL + 12;
-		/* Draw info about selected company when it is selected in the left window. */
-		GfxFillRect(r.left + 1, r.top + 1, r.right - 1, r.top + detail_height - 1, PC_DARK_BLUE);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, r.top + 12, STR_NETWORK_GAME_LOBBY_COMPANY_INFO, TC_FROMSTRING, SA_HOR_CENTER);
-
-		if (this->company == INVALID_COMPANY || StrEmpty(this->company_info[this->company].company_name)) return;
-
-		int y = r.top + detail_height + 4;
-		const NetworkGameInfo *gi = &this->server->info;
-
-		SetDParam(0, gi->clients_on);
-		SetDParam(1, gi->clients_max);
-		SetDParam(2, gi->companies_on);
-		SetDParam(3, gi->companies_max);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_SERVER_LIST_CLIENTS);
-		y += FONT_HEIGHT_NORMAL;
-
-		SetDParamStr(0, this->company_info[this->company].company_name);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_GAME_LOBBY_COMPANY_NAME);
-		y += FONT_HEIGHT_NORMAL;
-
-		SetDParam(0, this->company_info[this->company].inaugurated_year);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_GAME_LOBBY_INAUGURATION_YEAR); // inauguration year
-		y += FONT_HEIGHT_NORMAL;
-
-		SetDParam(0, this->company_info[this->company].company_value);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_GAME_LOBBY_VALUE); // company value
-		y += FONT_HEIGHT_NORMAL;
-
-		SetDParam(0, this->company_info[this->company].money);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_GAME_LOBBY_CURRENT_BALANCE); // current balance
-		y += FONT_HEIGHT_NORMAL;
-
-		SetDParam(0, this->company_info[this->company].income);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_GAME_LOBBY_LAST_YEARS_INCOME); // last year's income
-		y += FONT_HEIGHT_NORMAL;
-
-		SetDParam(0, this->company_info[this->company].performance);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_GAME_LOBBY_PERFORMANCE); // performance
-		y += FONT_HEIGHT_NORMAL;
-
-		SetDParam(0, this->company_info[this->company].num_vehicle[NETWORK_VEH_TRAIN]);
-		SetDParam(1, this->company_info[this->company].num_vehicle[NETWORK_VEH_LORRY]);
-		SetDParam(2, this->company_info[this->company].num_vehicle[NETWORK_VEH_BUS]);
-		SetDParam(3, this->company_info[this->company].num_vehicle[NETWORK_VEH_SHIP]);
-		SetDParam(4, this->company_info[this->company].num_vehicle[NETWORK_VEH_PLANE]);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_GAME_LOBBY_VEHICLES); // vehicles
-		y += FONT_HEIGHT_NORMAL;
-
-		SetDParam(0, this->company_info[this->company].num_station[NETWORK_VEH_TRAIN]);
-		SetDParam(1, this->company_info[this->company].num_station[NETWORK_VEH_LORRY]);
-		SetDParam(2, this->company_info[this->company].num_station[NETWORK_VEH_BUS]);
-		SetDParam(3, this->company_info[this->company].num_station[NETWORK_VEH_SHIP]);
-		SetDParam(4, this->company_info[this->company].num_station[NETWORK_VEH_PLANE]);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_GAME_LOBBY_STATIONS); // stations
-		y += FONT_HEIGHT_NORMAL;
-
-		SetDParamStr(0, this->company_info[this->company].clients);
-		DrawString(r.left + WD_FRAMERECT_LEFT, r.right - WD_FRAMERECT_RIGHT, y, STR_NETWORK_GAME_LOBBY_PLAYERS); // players
-	}
-
-	void OnClick(Point pt, int widget, int click_count) override
-	{
-		switch (widget) {
-			case WID_NL_CANCEL:   // Cancel button
-				ShowNetworkGameWindow();
-				break;
-
-			case WID_NL_MATRIX: { // Company list
-				uint id_v = this->vscroll->GetScrolledRowFromWidget(pt.y, this, WID_NL_MATRIX);
-				this->company = (id_v >= this->server->info.companies_on) ? INVALID_COMPANY : NetworkLobbyFindCompanyIndex(id_v);
-				this->SetDirty();
-
-				/* FIXME the disabling should go into some InvalidateData, which is called instead of the SetDirty */
-				if (click_count > 1 && !this->IsWidgetDisabled(WID_NL_JOIN)) this->OnClick(pt, WID_NL_JOIN, 1);
-				break;
-			}
-
-			case WID_NL_JOIN:     // Join company
-				/* Button can be clicked only when it is enabled. */
-				NetworkClientConnectGame(this->server->address, this->company);
-				break;
-
-			case WID_NL_NEW:      // New company
-				NetworkClientConnectGame(this->server->address, COMPANY_NEW_COMPANY);
-				break;
-
-			case WID_NL_SPECTATE: // Spectate game
-				NetworkClientConnectGame(this->server->address, COMPANY_SPECTATOR);
-				break;
-
-			case WID_NL_REFRESH:  // Refresh
-				/* Clear the information so removed companies don't remain */
-				for (auto &company : this->company_info) company = {};
-
-				NetworkTCPQueryServer(this->server->address, true);
-				break;
-		}
-	}
-
-	void OnResize() override
-	{
-		this->vscroll->SetCapacityFromWidget(this, WID_NL_MATRIX);
-	}
-};
-
-static const NWidgetPart _nested_network_lobby_window_widgets[] = {
-	NWidget(NWID_HORIZONTAL),
-		NWidget(WWT_CLOSEBOX, COLOUR_LIGHT_BLUE),
-		NWidget(WWT_CAPTION, COLOUR_LIGHT_BLUE), SetDataTip(STR_NETWORK_GAME_LOBBY_CAPTION, STR_TOOLTIP_WINDOW_TITLE_DRAG_THIS),
-	EndContainer(),
-	NWidget(WWT_PANEL, COLOUR_LIGHT_BLUE, WID_NL_BACKGROUND),
-		NWidget(WWT_TEXT, COLOUR_LIGHT_BLUE, WID_NL_TEXT), SetDataTip(STR_NETWORK_GAME_LOBBY_PREPARE_TO_JOIN, STR_NULL), SetResize(1, 0), SetPadding(10, 10, 0, 10),
-		NWidget(NWID_SPACER), SetMinimalSize(0, 3),
-		NWidget(NWID_HORIZONTAL), SetPIP(10, 0, 10),
-			/* Company list. */
-			NWidget(NWID_VERTICAL),
-				//NWidget(WWT_PANEL, COLOUR_WHITE, WID_NL_HEADER), SetMinimalSize(146, 0), SetResize(1, 0), SetFill(1, 0), EndContainer(),
-				NWidget(WWT_MATRIX, COLOUR_LIGHT_BLUE, WID_NL_MATRIX), SetMinimalSize(146, 0), SetResize(1, 1), SetFill(1, 1), SetMatrixDataTip(1, 0, STR_NETWORK_GAME_LOBBY_COMPANY_LIST_TOOLTIP), SetScrollbar(WID_NL_SCROLLBAR),
-			EndContainer(),
-			NWidget(NWID_VSCROLLBAR, COLOUR_LIGHT_BLUE, WID_NL_SCROLLBAR),
-			NWidget(NWID_SPACER), SetMinimalSize(5, 0), SetResize(0, 1),
-			/* Company info. */
-			NWidget(WWT_PANEL, COLOUR_LIGHT_BLUE, WID_NL_DETAILS), SetMinimalSize(232, 0), SetResize(1, 1), SetFill(1, 1), EndContainer(),
-		EndContainer(),
-		NWidget(NWID_SPACER), SetMinimalSize(0, 9),
-		/* Buttons. */
-		NWidget(NWID_HORIZONTAL, NC_EQUALSIZE), SetPIP(10, 3, 10),
-			NWidget(NWID_VERTICAL, NC_EQUALSIZE), SetPIP(0, 3, 0),
-				NWidget(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NL_JOIN), SetResize(1, 0), SetFill(1, 0), SetDataTip(STR_NETWORK_GAME_LOBBY_JOIN_COMPANY, STR_NETWORK_GAME_LOBBY_JOIN_COMPANY_TOOLTIP),
-				NWidget(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NL_NEW), SetResize(1, 0), SetFill(1, 0), SetDataTip(STR_NETWORK_GAME_LOBBY_NEW_COMPANY, STR_NETWORK_GAME_LOBBY_NEW_COMPANY_TOOLTIP),
-			EndContainer(),
-			NWidget(NWID_VERTICAL, NC_EQUALSIZE), SetPIP(0, 3, 0),
-				NWidget(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NL_SPECTATE), SetResize(1, 0), SetFill(1, 0), SetDataTip(STR_NETWORK_GAME_LOBBY_SPECTATE_GAME, STR_NETWORK_GAME_LOBBY_SPECTATE_GAME_TOOLTIP),
-				NWidget(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NL_REFRESH), SetResize(1, 0), SetFill(1, 0), SetDataTip(STR_NETWORK_SERVER_LIST_REFRESH, STR_NETWORK_SERVER_LIST_REFRESH_TOOLTIP),
-			EndContainer(),
-			NWidget(NWID_VERTICAL, NC_EQUALSIZE), SetPIP(0, 3, 0),
-				NWidget(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NL_CANCEL), SetResize(1, 0), SetFill(1, 0), SetDataTip(STR_BUTTON_CANCEL, STR_NULL),
-				NWidget(NWID_SPACER), SetFill(1, 1),
-			EndContainer(),
-		EndContainer(),
-		NWidget(NWID_SPACER), SetMinimalSize(0, 8),
-	EndContainer(),
-};
-
-static WindowDesc _network_lobby_window_desc(
-	WDP_CENTER, nullptr, 0, 0,
-	WC_NETWORK_WINDOW, WC_NONE,
-	0,
-	_nested_network_lobby_window_widgets, lengthof(_nested_network_lobby_window_widgets)
-);
-
-/**
- * Show the networklobbywindow with the selected server.
- * @param ngl Selected game pointer which is passed to the new window.
- */
-static void ShowNetworkLobbyWindow(NetworkGameList *ngl)
-{
-	if (!NetworkValidateClientName()) return;
-
-	DeleteWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_START);
-	DeleteWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_GAME);
-
-	strecpy(_settings_client.network.last_joined, ngl->address.GetAddressAsString(false).c_str(), lastof(_settings_client.network.last_joined));
-
-	NetworkTCPQueryServer(ngl->address, true);
-
-	new NetworkLobbyWindow(&_network_lobby_window_desc, ngl);
-}
-
-/**
- * Get the company information of a given company to fill for the lobby.
- * @param company the company to get the company info struct from.
- * @return the company info struct to write the (downloaded) data to.
- */
-NetworkCompanyInfo *GetLobbyCompanyInfo(CompanyID company)
-{
-	NetworkLobbyWindow *lobby = dynamic_cast<NetworkLobbyWindow*>(FindWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_LOBBY));
-	return (lobby != nullptr && company < MAX_COMPANIES) ? &lobby->company_info[company] : nullptr;
-}
-
-/**
- * Get the game information for the lobby.
- * @return the game info struct to write the (downloaded) data to.
- */
-NetworkGameList *GetLobbyGameInfo()
-{
-	NetworkLobbyWindow *lobby = dynamic_cast<NetworkLobbyWindow *>(FindWindowById(WC_NETWORK_WINDOW, WN_NETWORK_WINDOW_LOBBY));
-	return lobby != nullptr ? lobby->server : nullptr;
 }
 
 /* The window below gives information about the connected clients
@@ -1594,34 +1307,59 @@ static const NWidgetPart _nested_client_list_widgets[] = {
 		NWidget(WWT_STICKYBOX, COLOUR_GREY),
 	EndContainer(),
 	NWidget(WWT_PANEL, COLOUR_GREY),
-		NWidget(NWID_SELECTION, INVALID_COLOUR, WID_CL_SERVER_SELECTOR),
-			NWidget(WWT_FRAME, COLOUR_GREY), SetDataTip(STR_NETWORK_CLIENT_LIST_SERVER, STR_NULL), SetPadding(4, 4, 0, 4), SetPIP(0, 2, 0),
-				NWidget(NWID_HORIZONTAL), SetPIP(0, 3, 0),
-					NWidget(WWT_TEXT, COLOUR_GREY), SetMinimalTextLines(1, 0), SetDataTip(STR_NETWORK_CLIENT_LIST_SERVER_NAME, STR_NULL),
-					NWidget(NWID_SPACER), SetMinimalSize(20, 0),
-					NWidget(WWT_TEXT, COLOUR_GREY, WID_CL_SERVER_NAME), SetFill(1, 0), SetMinimalTextLines(1, 0), SetResize(1, 0), SetDataTip(STR_BLACK_RAW_STRING, STR_NETWORK_CLIENT_LIST_SERVER_NAME_TOOLTIP), SetAlignment(SA_VERT_CENTER | SA_RIGHT),
-					NWidget(WWT_PUSHIMGBTN, COLOUR_GREY, WID_CL_SERVER_NAME_EDIT), SetMinimalSize(12, 14), SetDataTip(SPR_RENAME, STR_NETWORK_CLIENT_LIST_SERVER_NAME_EDIT_TOOLTIP),
-				EndContainer(),
-				NWidget(NWID_HORIZONTAL), SetPIP(0, 3, 0),
-					NWidget(WWT_TEXT, COLOUR_GREY), SetMinimalTextLines(1, 0), SetDataTip(STR_NETWORK_CLIENT_LIST_SERVER_VISIBILITY, STR_NULL),
-					NWidget(NWID_SPACER), SetMinimalSize(20, 0), SetFill(1, 0), SetResize(1, 0),
-					NWidget(WWT_DROPDOWN, COLOUR_GREY, WID_CL_SERVER_VISIBILITY), SetDataTip(STR_BLACK_STRING, STR_NETWORK_CLIENT_LIST_SERVER_VISIBILITY_TOOLTIP),
-				EndContainer(),
-			EndContainer(),
-		EndContainer(),
-		NWidget(WWT_FRAME, COLOUR_GREY), SetDataTip(STR_NETWORK_CLIENT_LIST_PLAYER, STR_NULL), SetPadding(4, 4, 4, 4), SetPIP(0, 2, 0),
-			NWidget(NWID_HORIZONTAL), SetPIP(0, 3, 0),
-				NWidget(WWT_TEXT, COLOUR_GREY), SetMinimalTextLines(1, 0), SetDataTip(STR_NETWORK_CLIENT_LIST_PLAYER_NAME, STR_NULL),
-				NWidget(NWID_SPACER), SetMinimalSize(20, 0),
-				NWidget(WWT_TEXT, COLOUR_GREY, WID_CL_CLIENT_NAME), SetFill(1, 0), SetMinimalTextLines(1, 0), SetResize(1, 0), SetDataTip(STR_BLACK_RAW_STRING, STR_NETWORK_CLIENT_LIST_PLAYER_NAME_TOOLTIP), SetAlignment(SA_VERT_CENTER | SA_RIGHT),
-				NWidget(WWT_PUSHIMGBTN, COLOUR_GREY, WID_CL_CLIENT_NAME_EDIT), SetMinimalSize(12, 14), SetDataTip(SPR_RENAME, STR_NETWORK_CLIENT_LIST_PLAYER_NAME_EDIT_TOOLTIP),
-			EndContainer(),
-		EndContainer(),
 		NWidget(NWID_HORIZONTAL),
-			NWidget(WWT_MATRIX, COLOUR_GREY, WID_CL_MATRIX), SetMinimalSize(180, 0), SetResize(1, 1), SetFill(1, 1), SetMatrixDataTip(1, 0, STR_NULL), SetScrollbar(WID_CL_SCROLLBAR),
 			NWidget(NWID_VERTICAL),
-				NWidget(NWID_VSCROLLBAR, COLOUR_GREY, WID_CL_SCROLLBAR),
-				NWidget(WWT_RESIZEBOX, COLOUR_GREY),
+				NWidget(WWT_FRAME, COLOUR_GREY), SetDataTip(STR_NETWORK_CLIENT_LIST_SERVER, STR_NULL), SetPadding(4, 4, 0, 4), SetPIP(0, 2, 0),
+					NWidget(NWID_HORIZONTAL), SetPIP(0, 3, 0),
+						NWidget(WWT_TEXT, COLOUR_GREY), SetMinimalTextLines(1, 0), SetDataTip(STR_NETWORK_CLIENT_LIST_SERVER_NAME, STR_NULL),
+						NWidget(NWID_SPACER), SetMinimalSize(10, 0),
+						NWidget(WWT_TEXT, COLOUR_GREY, WID_CL_SERVER_NAME), SetFill(1, 0), SetMinimalTextLines(1, 0), SetResize(1, 0), SetDataTip(STR_BLACK_RAW_STRING, STR_NETWORK_CLIENT_LIST_SERVER_NAME_TOOLTIP), SetAlignment(SA_VERT_CENTER | SA_RIGHT),
+						NWidget(WWT_PUSHIMGBTN, COLOUR_GREY, WID_CL_SERVER_NAME_EDIT), SetMinimalSize(12, 14), SetDataTip(SPR_RENAME, STR_NETWORK_CLIENT_LIST_SERVER_NAME_EDIT_TOOLTIP),
+					EndContainer(),
+					NWidget(NWID_SELECTION, INVALID_COLOUR, WID_CL_SERVER_SELECTOR),
+						NWidget(NWID_VERTICAL),
+							NWidget(NWID_HORIZONTAL), SetPIP(0, 3, 0),
+								NWidget(WWT_TEXT, COLOUR_GREY), SetMinimalTextLines(1, 0), SetDataTip(STR_NETWORK_CLIENT_LIST_SERVER_VISIBILITY, STR_NULL),
+								NWidget(NWID_SPACER), SetMinimalSize(10, 0), SetFill(1, 0), SetResize(1, 0),
+								NWidget(WWT_DROPDOWN, COLOUR_GREY, WID_CL_SERVER_VISIBILITY), SetDataTip(STR_BLACK_STRING, STR_NETWORK_CLIENT_LIST_SERVER_VISIBILITY_TOOLTIP),
+							EndContainer(),
+							NWidget(NWID_HORIZONTAL), SetPIP(0, 3, 0),
+								NWidget(WWT_TEXT, COLOUR_GREY), SetMinimalTextLines(1, 0), SetDataTip(STR_NETWORK_CLIENT_LIST_SERVER_INVITE_CODE, STR_NULL),
+								NWidget(NWID_SPACER), SetMinimalSize(10, 0),
+								NWidget(WWT_TEXT, COLOUR_GREY, WID_CL_SERVER_INVITE_CODE), SetFill(1, 0), SetMinimalTextLines(1, 0), SetResize(1, 0), SetDataTip(STR_BLACK_RAW_STRING, STR_NETWORK_CLIENT_LIST_SERVER_INVITE_CODE_TOOLTIP), SetAlignment(SA_VERT_CENTER | SA_RIGHT),
+							EndContainer(),
+							NWidget(NWID_HORIZONTAL), SetPIP(0, 3, 0),
+								NWidget(NWID_SPACER), SetMinimalSize(10, 0), SetFill(1, 0), SetResize(1, 0),
+								NWidget(WWT_PUSHTXTBTN, COLOUR_GREY, WID_CL_SERVER_COPY_TO_CLIPBOARD), SetDataTip(STR_NETWORK_CLIENT_LIST_SERVER_COPY_TO_CLIPBOARD, STR_NETWORK_CLIENT_LIST_SERVER_COPY_TO_CLIPBOARD),
+							EndContainer(),
+							NWidget(NWID_HORIZONTAL), SetPIP(0, 3, 0),
+								NWidget(WWT_TEXT, COLOUR_GREY), SetMinimalTextLines(1, 0), SetDataTip(STR_NETWORK_CLIENT_LIST_SERVER_CONNECTION_TYPE, STR_NULL),
+								NWidget(NWID_SPACER), SetMinimalSize(10, 0),
+								NWidget(WWT_TEXT, COLOUR_GREY, WID_CL_SERVER_CONNECTION_TYPE), SetFill(1, 0), SetMinimalTextLines(1, 0), SetResize(1, 0), SetDataTip(STR_BLACK_STRING, STR_NETWORK_CLIENT_LIST_SERVER_CONNECTION_TYPE_TOOLTIP), SetAlignment(SA_VERT_CENTER | SA_RIGHT),
+							EndContainer(),
+						EndContainer(),
+					EndContainer(),
+				EndContainer(),
+				NWidget(WWT_FRAME, COLOUR_GREY), SetDataTip(STR_NETWORK_CLIENT_LIST_PLAYER, STR_NULL), SetPadding(4, 4, 4, 4), SetPIP(0, 2, 0),
+					NWidget(NWID_HORIZONTAL), SetPIP(0, 3, 0),
+						NWidget(WWT_TEXT, COLOUR_GREY), SetMinimalTextLines(1, 0), SetDataTip(STR_NETWORK_CLIENT_LIST_PLAYER_NAME, STR_NULL),
+						NWidget(NWID_SPACER), SetMinimalSize(10, 0),
+						NWidget(WWT_TEXT, COLOUR_GREY, WID_CL_CLIENT_NAME), SetFill(1, 0), SetMinimalTextLines(1, 0), SetResize(1, 0), SetDataTip(STR_BLACK_RAW_STRING, STR_NETWORK_CLIENT_LIST_PLAYER_NAME_TOOLTIP), SetAlignment(SA_VERT_CENTER | SA_RIGHT),
+						NWidget(WWT_PUSHIMGBTN, COLOUR_GREY, WID_CL_CLIENT_NAME_EDIT), SetMinimalSize(12, 14), SetDataTip(SPR_RENAME, STR_NETWORK_CLIENT_LIST_PLAYER_NAME_EDIT_TOOLTIP),
+					EndContainer(),
+				EndContainer(),
+			EndContainer(),
+			NWidget(NWID_HORIZONTAL),
+				NWidget(NWID_VERTICAL),
+					NWidget(WWT_MATRIX, COLOUR_GREY, WID_CL_MATRIX), SetMinimalSize(180, 0), SetResize(1, 1), SetFill(1, 1), SetMatrixDataTip(1, 0, STR_NULL), SetScrollbar(WID_CL_SCROLLBAR),
+					NWidget(WWT_PANEL, COLOUR_GREY),
+                        NWidget(WWT_TEXT, COLOUR_GREY, WID_CL_CLIENT_COMPANY_COUNT), SetFill(1, 0), SetMinimalTextLines(1, 0), SetResize(1, 0), SetPadding(2, 1, 2, 1), SetAlignment(SA_CENTER), SetDataTip(STR_NETWORK_CLIENT_LIST_CLIENT_COMPANY_COUNT, STR_NULL),
+				    EndContainer(),
+                EndContainer(),
+				NWidget(NWID_VERTICAL),
+					NWidget(NWID_VSCROLLBAR, COLOUR_GREY, WID_CL_SCROLLBAR),
+					NWidget(WWT_RESIZEBOX, COLOUR_GREY),
+				EndContainer(),
 			EndContainer(),
 		EndContainer(),
 	EndContainer(),
@@ -1652,7 +1390,7 @@ enum DropDownAdmin {
  */
 static void AdminClientKickCallback(Window *w, bool confirmed)
 {
-	if (confirmed) NetworkServerKickClient(_admin_client_id, nullptr);
+	if (confirmed) NetworkServerKickClient(_admin_client_id, {});
 }
 
 /**
@@ -1662,7 +1400,7 @@ static void AdminClientKickCallback(Window *w, bool confirmed)
  */
 static void AdminClientBanCallback(Window *w, bool confirmed)
 {
-	if (confirmed) NetworkServerKickOrBanIP(_admin_client_id, true, nullptr);
+	if (confirmed) NetworkServerKickOrBanIP(_admin_client_id, true, {});
 }
 
 /**
@@ -1674,7 +1412,7 @@ static void AdminCompanyResetCallback(Window *w, bool confirmed)
 {
 	if (confirmed) {
 		if (NetworkCompanyHasClients(_admin_company_id)) return;
-		DoCommandP(0, CCA_DELETE | _admin_company_id << 16 | CRR_MANUAL << 24, 0, CMD_COMPANY_CTRL);
+		Command<CMD_COMPANY_CTRL>::Post(CCA_DELETE, _admin_company_id, CRR_MANUAL, INVALID_CLIENT_ID);
 	}
 }
 
@@ -1711,8 +1449,8 @@ public:
 		disabled(disabled)
 	{
 		Dimension d = GetSpriteSize(sprite);
-		this->height = d.height + ScaleGUITrad(WD_FRAMERECT_TOP + WD_FRAMERECT_BOTTOM);
-		this->width = d.width + ScaleGUITrad(WD_FRAMERECT_LEFT + WD_FRAMERECT_RIGHT);
+		this->height = d.height + WidgetDimensions::scaled.framerect.Vertical();
+		this->width = d.width + WidgetDimensions::scaled.framerect.Horizontal();
 	}
 	virtual ~ButtonCommon() {}
 
@@ -1772,8 +1510,6 @@ private:
 
 	std::map<uint, std::vector<std::unique_ptr<ButtonCommon>>> buttons; ///< Per line which buttons are available.
 
-	static const int CLIENT_OFFSET_LEFT = 12; ///< Offset of client entries compared to company entries.
-
 	/**
 	 * Chat button on a Company is clicked.
 	 * @param w The instance of this window.
@@ -1814,9 +1550,9 @@ private:
 	static void OnClickCompanyNew(NetworkClientListWindow *w, Point pt, CompanyID company_id)
 	{
 		if (_network_server) {
-			DoCommandP(0, CCA_NEW, _network_own_client_id, CMD_COMPANY_CTRL);
+			Command<CMD_COMPANY_CTRL>::Post(CCA_NEW, INVALID_COMPANY, CRR_NONE, _network_own_client_id);
 		} else {
-			NetworkSendCommand(0, CCA_NEW, 0, CMD_COMPANY_CTRL, nullptr, nullptr, _local_company);
+			Command<CMD_COMPANY_CTRL>::SendNet(STR_NULL, _local_company, CCA_NEW, INVALID_COMPANY, CRR_NONE, INVALID_CLIENT_ID);
 		}
 	}
 
@@ -1839,7 +1575,7 @@ private:
 		wi_rect.bottom = pt.y;
 
 		w->dd_client_id = client_id;
-		ShowDropDownListAt(w, std::move(list), -1, WID_CL_MATRIX, wi_rect, COLOUR_GREY, true, true);
+		ShowDropDownListAt(w, std::move(list), -1, WID_CL_MATRIX, wi_rect, COLOUR_GREY, true, false);
 	}
 
 	/**
@@ -1861,7 +1597,7 @@ private:
 		wi_rect.bottom = pt.y;
 
 		w->dd_company_id = company_id;
-		ShowDropDownListAt(w, std::move(list), -1, WID_CL_MATRIX, wi_rect, COLOUR_GREY, true, true);
+		ShowDropDownListAt(w, std::move(list), -1, WID_CL_MATRIX, wi_rect, COLOUR_GREY, true, false);
 	}
 	/**
 	 * Chat button on a Client is clicked.
@@ -1877,15 +1613,15 @@ private:
 	/**
 	 * Part of RebuildList() to create the information for a single company.
 	 * @param company_id The company to build the list for.
-	 * @param own_ci The NetworkClientInfo of the client itself.
+	 * @param client_playas The company the client is joined as.
 	 */
-	void RebuildListCompany(CompanyID company_id, const NetworkClientInfo *own_ci)
+	void RebuildListCompany(CompanyID company_id, CompanyID client_playas)
 	{
 		ButtonCommon *chat_button = new CompanyButton(SPR_CHAT, company_id == COMPANY_SPECTATOR ? STR_NETWORK_CLIENT_LIST_CHAT_SPECTATOR_TOOLTIP : STR_NETWORK_CLIENT_LIST_CHAT_COMPANY_TOOLTIP, COLOUR_ORANGE, company_id, &NetworkClientListWindow::OnClickCompanyChat);
 
 		if (_network_server) this->buttons[line_count].emplace_back(new CompanyButton(SPR_ADMIN, STR_NETWORK_CLIENT_LIST_ADMIN_COMPANY_TOOLTIP, COLOUR_RED, company_id, &NetworkClientListWindow::OnClickCompanyAdmin, company_id == COMPANY_SPECTATOR));
 		this->buttons[line_count].emplace_back(chat_button);
-		if (own_ci->client_playas != company_id) this->buttons[line_count].emplace_back(new CompanyButton(SPR_JOIN, STR_NETWORK_CLIENT_LIST_JOIN_TOOLTIP, COLOUR_ORANGE, company_id, &NetworkClientListWindow::OnClickCompanyJoin));
+		if (client_playas != company_id) this->buttons[line_count].emplace_back(new CompanyButton(SPR_JOIN, STR_NETWORK_CLIENT_LIST_JOIN_TOOLTIP, COLOUR_ORANGE, company_id, &NetworkClientListWindow::OnClickCompanyJoin, company_id != COMPANY_SPECTATOR && Company::Get(company_id)->is_ai));
 
 		this->line_count += 1;
 
@@ -1916,6 +1652,7 @@ private:
 	void RebuildList()
 	{
 		const NetworkClientInfo *own_ci = NetworkClientInfo::GetByClientID(_network_own_client_id);
+		CompanyID client_playas = own_ci == nullptr ? COMPANY_SPECTATOR : own_ci->client_playas;
 
 		this->buttons.clear();
 		this->line_count = 0;
@@ -1923,24 +1660,24 @@ private:
 		this->player_self_index = -1;
 
 		/* As spectator, show a line to create a new company. */
-		if (own_ci->client_playas == COMPANY_SPECTATOR && !NetworkMaxCompaniesReached()) {
+		if (client_playas == COMPANY_SPECTATOR && !NetworkMaxCompaniesReached()) {
 			this->buttons[line_count].emplace_back(new CompanyButton(SPR_JOIN, STR_NETWORK_CLIENT_LIST_NEW_COMPANY_TOOLTIP, COLOUR_ORANGE, COMPANY_SPECTATOR, &NetworkClientListWindow::OnClickCompanyNew));
 			this->line_count += 1;
 		}
 
-		if (own_ci->client_playas != COMPANY_SPECTATOR) {
-			this->RebuildListCompany(own_ci->client_playas, own_ci);
+		if (client_playas != COMPANY_SPECTATOR) {
+			this->RebuildListCompany(client_playas, client_playas);
 		}
 
 		/* Companies */
 		for (const Company *c : Company::Iterate()) {
-			if (c->index == own_ci->client_playas) continue;
+			if (c->index == client_playas) continue;
 
-			this->RebuildListCompany(c->index, own_ci);
+			this->RebuildListCompany(c->index, client_playas);
 		}
 
 		/* Spectators */
-		this->RebuildListCompany(COMPANY_SPECTATOR, own_ci);
+		this->RebuildListCompany(COMPANY_SPECTATOR, client_playas);
 
 		this->vscroll->SetCount(this->line_count);
 	}
@@ -1953,10 +1690,10 @@ private:
 	ButtonCommon *GetButtonAtPoint(Point pt)
 	{
 		uint index = this->vscroll->GetScrolledRowFromWidget(pt.y, this, WID_CL_MATRIX);
-		NWidgetBase *widget_matrix = this->GetWidget<NWidgetBase>(WID_CL_MATRIX);
+		Rect matrix = this->GetWidget<NWidgetBase>(WID_CL_MATRIX)->GetCurrentRect().Shrink(WidgetDimensions::scaled.framerect);
 
 		bool rtl = _current_text_dir == TD_RTL;
-		uint x = rtl ? (uint)widget_matrix->pos_x + WD_FRAMERECT_LEFT : widget_matrix->current_x - WD_FRAMERECT_RIGHT;
+		uint x = rtl ? matrix.left : matrix.right;
 
 		/* Find the buttons for this row. */
 		auto button_find = this->buttons.find(index);
@@ -1971,7 +1708,7 @@ private:
 				return button.get();
 			}
 
-			int width = button->width + WD_FRAMERECT_LEFT + WD_FRAMERECT_RIGHT;
+			int width = button->width + WidgetDimensions::scaled.framerect.Horizontal();
 			x += rtl ? width : -width;
 		}
 
@@ -1991,27 +1728,33 @@ public:
 		this->FinishInitNested(window_number);
 	}
 
+	void OnInit() override
+	{
+		RebuildList();
+	}
+
 	void OnInvalidateData(int data = 0, bool gui_scope = true) override
 	{
 		this->RebuildList();
 
 		/* Currently server information is not sync'd to clients, so we cannot show it on clients. */
 		this->GetWidget<NWidgetStacked>(WID_CL_SERVER_SELECTOR)->SetDisplayedPlane(_network_server ? 0 : SZSP_HORIZONTAL);
+		this->SetWidgetDisabledState(WID_CL_SERVER_NAME_EDIT, !_network_server);
 	}
 
 	void UpdateWidgetSize(int widget, Dimension *size, const Dimension &padding, Dimension *fill, Dimension *resize) override
 	{
 		switch (widget) {
 			case WID_CL_SERVER_VISIBILITY:
-				*size = maxdim(GetStringBoundingBox(_server_visibility_dropdown[0]), GetStringBoundingBox(_server_visibility_dropdown[1]));
+				*size = maxdim(maxdim(GetStringBoundingBox(STR_NETWORK_SERVER_VISIBILITY_LOCAL), GetStringBoundingBox(STR_NETWORK_SERVER_VISIBILITY_PUBLIC)), GetStringBoundingBox(STR_NETWORK_SERVER_VISIBILITY_INVITE_ONLY));
 				size->width += padding.width;
 				size->height += padding.height;
 				break;
 
 			case WID_CL_MATRIX: {
 				uint height = std::max({GetSpriteSize(SPR_COMPANY_ICON).height, GetSpriteSize(SPR_JOIN).height, GetSpriteSize(SPR_ADMIN).height, GetSpriteSize(SPR_CHAT).height});
-				height += ScaleGUITrad(WD_FRAMERECT_TOP) + ScaleGUITrad(WD_FRAMERECT_BOTTOM);
-				this->line_height = std::max(height, (uint)FONT_HEIGHT_NORMAL) + ScaleGUITrad(WD_MATRIX_TOP + WD_MATRIX_BOTTOM);
+				height += WidgetDimensions::scaled.framerect.Vertical();
+				this->line_height = std::max(height, (uint)FONT_HEIGHT_NORMAL) + padding.height;
 
 				resize->width = 1;
 				resize->height = this->line_height;
@@ -2031,15 +1774,32 @@ public:
 	{
 		switch (widget) {
 			case WID_CL_SERVER_NAME:
-				SetDParamStr(0, _settings_client.network.server_name);
+				SetDParamStr(0, _network_server ? _settings_client.network.server_name : _network_server_name);
 				break;
 
 			case WID_CL_SERVER_VISIBILITY:
-				SetDParam(0, _server_visibility_dropdown[_settings_client.network.server_advertise]);
+				SetDParam(0, STR_NETWORK_SERVER_VISIBILITY_LOCAL + _settings_client.network.server_game_type);
 				break;
 
-			case WID_CL_CLIENT_NAME:
-				SetDParamStr(0, _settings_client.network.client_name);
+			case WID_CL_SERVER_INVITE_CODE: {
+				static std::string empty = {};
+				SetDParamStr(0, _network_server_connection_type == CONNECTION_TYPE_UNKNOWN ? empty : _network_server_invite_code);
+				break;
+			}
+
+			case WID_CL_SERVER_CONNECTION_TYPE:
+				SetDParam(0, STR_NETWORK_CLIENT_LIST_SERVER_CONNECTION_TYPE_UNKNOWN + _network_server_connection_type);
+				break;
+
+			case WID_CL_CLIENT_NAME: {
+				const NetworkClientInfo *own_ci = NetworkClientInfo::GetByClientID(_network_own_client_id);
+				SetDParamStr(0, own_ci != nullptr ? own_ci->client_name : _settings_client.network.client_name);
+				break;
+			}
+
+			case WID_CL_CLIENT_COMPANY_COUNT:
+				SetDParam(0, NetworkClientInfo::GetNumItems());
+				SetDParam(1, Company::GetNumItems());
 				break;
 		}
 	}
@@ -2055,16 +1815,21 @@ public:
 				ShowQueryString(STR_JUST_RAW_STRING, STR_NETWORK_CLIENT_LIST_SERVER_NAME_QUERY_CAPTION, NETWORK_NAME_LENGTH, this, CS_ALPHANUMERAL, QSF_LEN_IN_CHARS);
 				break;
 
-			case WID_CL_CLIENT_NAME_EDIT:
+			case WID_CL_CLIENT_NAME_EDIT: {
+				const NetworkClientInfo *own_ci = NetworkClientInfo::GetByClientID(_network_own_client_id);
 				this->query_widget = WID_CL_CLIENT_NAME_EDIT;
-				SetDParamStr(0, _settings_client.network.client_name);
+				SetDParamStr(0, own_ci != nullptr ? own_ci->client_name : _settings_client.network.client_name);
 				ShowQueryString(STR_JUST_RAW_STRING, STR_NETWORK_CLIENT_LIST_PLAYER_NAME_QUERY_CAPTION, NETWORK_CLIENT_NAME_LENGTH, this, CS_ALPHANUMERAL, QSF_LEN_IN_CHARS);
+				break;
+			}
+			case WID_CL_SERVER_COPY_TO_CLIPBOARD:
+				VideoDriver::GetInstance()->SetClipboardContents(_network_server_invite_code);
 				break;
 
 			case WID_CL_SERVER_VISIBILITY:
 				if (!_network_server) break;
 
-				ShowDropDownMenu(this, _server_visibility_dropdown, _settings_client.network.server_advertise, WID_CL_SERVER_VISIBILITY, 0, 0);
+				ShowDropDownList(this, BuildVisibilityDropDownList(), _settings_client.network.server_game_type, WID_CL_SERVER_VISIBILITY);
 				break;
 
 			case WID_CL_MATRIX: {
@@ -2084,14 +1849,14 @@ public:
 				int index = this->vscroll->GetScrolledRowFromWidget(pt.y, this, WID_CL_MATRIX);
 
 				bool rtl = _current_text_dir == TD_RTL;
-				NWidgetBase *widget_matrix = this->GetWidget<NWidgetBase>(WID_CL_MATRIX);
+				Rect matrix = this->GetWidget<NWidgetBase>(WID_CL_MATRIX)->GetCurrentRect().Shrink(WidgetDimensions::scaled.framerect);
 
 				Dimension d = GetSpriteSize(SPR_COMPANY_ICON);
-				uint text_left = widget_matrix->pos_x + (rtl ? (uint)WD_FRAMERECT_LEFT : d.width + 8);
-				uint text_right = widget_matrix->pos_x + widget_matrix->current_x - (rtl ? d.width + 8 : (uint)WD_FRAMERECT_RIGHT);
+				uint text_left  = matrix.left  + (rtl ? 0 : d.width + WidgetDimensions::scaled.hsep_wide);
+				uint text_right = matrix.right - (rtl ? d.width + WidgetDimensions::scaled.hsep_wide : 0);
 
 				Dimension d2 = GetSpriteSize(SPR_PLAYER_SELF);
-				uint offset_x = CLIENT_OFFSET_LEFT - d2.width - 3;
+				uint offset_x = WidgetDimensions::scaled.hsep_indent - d2.width - ScaleGUITrad(3);
 
 				uint player_icon_x = rtl ? text_right - offset_x - d2.width : text_left + offset_x;
 
@@ -2130,7 +1895,8 @@ public:
 			case WID_CL_SERVER_VISIBILITY:
 				if (!_network_server) break;
 
-				_settings_client.network.server_advertise = (index != 0);
+				_settings_client.network.server_game_type = (ServerGameType)index;
+				NetworkUpdateServerGameType();
 				break;
 
 			case WID_CL_MATRIX: {
@@ -2196,19 +1962,13 @@ public:
 			case WID_CL_SERVER_NAME_EDIT: {
 				if (!_network_server) break;
 
-				uint index;
-				GetSettingFromName("network.server_name", &index);
-				SetSettingValue(index, StrEmpty(str) ? "Unnamed Server" : str);
+				SetSettingValue(GetSettingFromName("network.server_name")->AsStringSetting(), str);
 				this->InvalidateData();
 				break;
 			}
 
 			case WID_CL_CLIENT_NAME_EDIT: {
-				if (!NetworkValidateClientName(str)) break;
-
-				uint index;
-				GetSettingFromName("network.client_name", &index);
-				SetSettingValue(index, str);
+				SetSettingValue(GetSettingFromName("network.client_name")->AsStringSetting(), str);
 				this->InvalidateData();
 				break;
 			}
@@ -2229,23 +1989,26 @@ public:
 	 * @param y The y-position to start with the buttons.
 	 * @param buttons The buttons to draw.
 	 */
-	void DrawButtons(uint &x, uint y, const std::vector<std::unique_ptr<ButtonCommon>> &buttons) const
+	void DrawButtons(int &x, uint y, const std::vector<std::unique_ptr<ButtonCommon>> &buttons) const
 	{
+		Rect r;
+
 		for (auto &button : buttons) {
 			bool rtl = _current_text_dir == TD_RTL;
 
-			uint left = rtl ? x : x - button->width;
-			uint right = rtl ? x + button->width : x;
+			int offset = (this->line_height - button->height) / 2;
+			r.left = rtl ? x : x - button->width + 1;
+			r.right = rtl ? x + button->width - 1 : x;
+			r.top = y + offset;
+			r.bottom = r.top + button->height - 1;
 
-			int offset = std::max(0, ((int)(this->line_height + 1) - (int)button->height) / 2);
-
-			DrawFrameRect(left, y + offset, right, y + offset + button->height, button->colour, FR_NONE);
-			DrawSprite(button->sprite, PAL_NONE, left + ScaleGUITrad(WD_FRAMERECT_LEFT), y + offset + ScaleGUITrad(WD_FRAMERECT_TOP));
+			DrawFrameRect(r, button->colour, FR_NONE);
+			DrawSprite(button->sprite, PAL_NONE, r.left + WidgetDimensions::scaled.framerect.left, r.top + WidgetDimensions::scaled.framerect.top);
 			if (button->disabled) {
-				GfxFillRect(left + 1, y + offset + 1, right - 1, y + offset + button->height - 1, _colour_gradient[button->colour & 0xF][2], FILLRECT_CHECKER);
+				GfxFillRect(r.Shrink(WidgetDimensions::scaled.bevel), _colour_gradient[button->colour & 0xF][2], FILLRECT_CHECKER);
 			}
 
-			int width = button->width + WD_FRAMERECT_LEFT + WD_FRAMERECT_RIGHT;
+			int width = button->width + WidgetDimensions::scaled.hsep_normal;
 			x += rtl ? width : -width;
 		}
 	}
@@ -2253,30 +2016,27 @@ public:
 	/**
 	 * Draw a company and its clients on the matrix.
 	 * @param company_id The company to draw.
-	 * @param left The most left pixel of the line.
-	 * @param right The most right pixel of the line.
-	 * @param top The top of the first line.
+	 * @param r The rect to draw within.
 	 * @param line The Nth line we are drawing. Updated during this function.
 	 */
-	void DrawCompany(CompanyID company_id, uint left, uint right, uint top, uint &line) const
+	void DrawCompany(CompanyID company_id, const Rect &r, uint &line) const
 	{
 		bool rtl = _current_text_dir == TD_RTL;
-		int text_y_offset = std::max(0, ((int)(this->line_height + 1) - (int)FONT_HEIGHT_NORMAL) / 2) + WD_MATRIX_BOTTOM;
+		int text_y_offset = CenterBounds(0, this->line_height, FONT_HEIGHT_NORMAL);
 
 		Dimension d = GetSpriteSize(SPR_COMPANY_ICON);
-		int offset = std::max(0, ((int)(this->line_height + 1) - (int)d.height) / 2);
-
-		uint text_left = left + (rtl ? (uint)WD_FRAMERECT_LEFT : d.width + 8);
-		uint text_right = right - (rtl ? d.width + 8 : (uint)WD_FRAMERECT_RIGHT);
+		int offset = CenterBounds(0, this->line_height, d.height);
 
 		uint line_start = this->vscroll->GetPosition();
 		uint line_end = line_start + this->vscroll->GetCapacity();
 
-		uint y = top + (this->line_height * (line - line_start));
+		uint y = r.top + (this->line_height * (line - line_start));
 
 		/* Draw the company line (if in range of scrollbar). */
 		if (IsInsideMM(line, line_start, line_end)) {
-			uint x = rtl ? text_left : text_right;
+			int icon_left = r.WithWidth(d.width, rtl).left;
+			Rect tr = r.Indent(d.width + WidgetDimensions::scaled.hsep_normal, rtl);
+			int &x = rtl ? tr.left : tr.right;
 
 			/* If there are buttons for this company, draw them. */
 			auto button_find = this->buttons.find(line);
@@ -2285,17 +2045,17 @@ public:
 			}
 
 			if (company_id == COMPANY_SPECTATOR) {
-				DrawSprite(SPR_COMPANY_ICON, PALETTE_TO_GREY, rtl ? right - d.width - 4 : left + 4, y + offset);
-				DrawString(rtl ? x : text_left, rtl ? text_right : x, y + text_y_offset, STR_NETWORK_CLIENT_LIST_SPECTATORS, TC_SILVER);
+				DrawSprite(SPR_COMPANY_ICON, PALETTE_TO_GREY, icon_left, y + offset);
+				DrawString(tr.left, tr.right, y + text_y_offset, STR_NETWORK_CLIENT_LIST_SPECTATORS, TC_SILVER);
 			} else if (company_id == COMPANY_NEW_COMPANY) {
-				DrawSprite(SPR_COMPANY_ICON, PALETTE_TO_GREY, rtl ? right - d.width - 4 : left + 4, y + offset);
-				DrawString(rtl ? x : text_left, rtl ? text_right : x, y + text_y_offset, STR_NETWORK_CLIENT_LIST_NEW_COMPANY, TC_WHITE);
+				DrawSprite(SPR_COMPANY_ICON, PALETTE_TO_GREY, icon_left, y + offset);
+				DrawString(tr.left, tr.right, y + text_y_offset, STR_NETWORK_CLIENT_LIST_NEW_COMPANY, TC_WHITE);
 			} else {
-				DrawCompanyIcon(company_id, rtl ? right - d.width - 4 : left + 4, y + offset);
+				DrawCompanyIcon(company_id, icon_left, y + offset);
 
 				SetDParam(0, company_id);
 				SetDParam(1, company_id);
-				DrawString(rtl ? x : text_left, rtl ? text_right : x, y + text_y_offset, STR_COMPANY_NAME, TC_SILVER);
+				DrawString(tr.left, tr.right, y + text_y_offset, STR_COMPANY_NAME, TC_SILVER);
 			}
 		}
 
@@ -2307,11 +2067,12 @@ public:
 
 			/* Draw the player line (if in range of scrollbar). */
 			if (IsInsideMM(line, line_start, line_end)) {
-				uint x = rtl ? text_left : text_right;
+				Rect tr = r.Indent(WidgetDimensions::scaled.hsep_indent, rtl);
 
 				/* If there are buttons for this client, draw them. */
 				auto button_find = this->buttons.find(line);
 				if (button_find != this->buttons.end()) {
+					int &x = rtl ? tr.left : tr.right;
 					this->DrawButtons(x, y, button_find->second);
 				}
 
@@ -2324,13 +2085,13 @@ public:
 
 				if (player_icon != 0) {
 					Dimension d2 = GetSpriteSize(player_icon);
-					uint offset_x = CLIENT_OFFSET_LEFT - 3;
-					int offset_y = std::max(0, ((int)(this->line_height + 1) - (int)d2.height) / 2);
-					DrawSprite(player_icon, PALETTE_TO_GREY, rtl ? text_right - offset_x : text_left + offset_x - d2.width, y + offset_y);
+					int offset_y = CenterBounds(0, this->line_height, d2.height);
+					DrawSprite(player_icon, PALETTE_TO_GREY, rtl ? tr.right - d2.width : tr.left, y + offset_y);
+					tr = tr.Indent(d2.width + WidgetDimensions::scaled.hsep_normal, rtl);
 				}
 
 				SetDParamStr(0, ci->client_name);
-				DrawString(rtl ? x : text_left + CLIENT_OFFSET_LEFT, rtl ? text_right - CLIENT_OFFSET_LEFT : x, y + text_y_offset, STR_JUST_RAW_STRING, TC_BLACK);
+				DrawString(tr.left, tr.right, y + text_y_offset, STR_JUST_RAW_STRING, TC_BLACK);
 			}
 
 			y += this->line_height;
@@ -2342,50 +2103,51 @@ public:
 	{
 		switch (widget) {
 			case WID_CL_MATRIX: {
+				Rect ir = r.Shrink(WidgetDimensions::scaled.framerect, RectPadding::zero);
 				uint line = 0;
 
 				if (this->hover_index >= 0) {
-					uint offset = this->hover_index * this->line_height;
-					GfxFillRect(r.left + 2, r.top + offset, r.right - 1, r.top + offset + this->line_height - 1, GREY_SCALE(9));
+					Rect br = r.WithHeight(this->line_height).Translate(0, this->hover_index * this->line_height);
+					GfxFillRect(br.Shrink(WidgetDimensions::scaled.bevel), GREY_SCALE(9));
 				}
 
 				NetworkClientInfo *own_ci = NetworkClientInfo::GetByClientID(_network_own_client_id);
-				if (own_ci->client_playas == COMPANY_SPECTATOR && !NetworkMaxCompaniesReached()) {
-					this->DrawCompany(COMPANY_NEW_COMPANY, r.left, r.right, r.top, line);
+				CompanyID client_playas = own_ci == nullptr ? COMPANY_SPECTATOR : own_ci->client_playas;
+
+				if (client_playas == COMPANY_SPECTATOR && !NetworkMaxCompaniesReached()) {
+					this->DrawCompany(COMPANY_NEW_COMPANY, ir, line);
 				}
 
-				if (own_ci->client_playas != COMPANY_SPECTATOR) {
-					this->DrawCompany(own_ci->client_playas, r.left, r.right, r.top, line);
+				if (client_playas != COMPANY_SPECTATOR) {
+					this->DrawCompany(client_playas, ir, line);
 				}
 
 				for (const Company *c : Company::Iterate()) {
-					if (own_ci->client_playas == c->index) continue;
-					this->DrawCompany(c->index, r.left, r.right, r.top, line);
+					if (client_playas == c->index) continue;
+					this->DrawCompany(c->index, ir, line);
 				}
 
-				/* Specators */
-				this->DrawCompany(COMPANY_SPECTATOR, r.left, r.right, r.top, line);
+				/* Spectators */
+				this->DrawCompany(COMPANY_SPECTATOR, ir, line);
 
 				break;
 			}
 		}
 	}
 
-	virtual void OnMouseLoop() override
+	void OnMouseOver(Point pt, int widget) override
 	{
-		if (GetWidgetFromPos(this, _cursor.pos.x - this->left, _cursor.pos.y - this->top) != WID_CL_MATRIX) {
-			this->hover_index = -1;
-			this->SetDirty();
-			return;
-		}
-
-		NWidgetBase *nwi = this->GetWidget<NWidgetBase>(WID_CL_MATRIX);
-		int y = _cursor.pos.y - this->top - nwi->pos_y - 2;
-		int index = y / this->line_height;
-
-		if (index != this->hover_index) {
-			this->hover_index = index;
-			this->SetDirty();
+		if (widget != WID_CL_MATRIX) {
+			if (this->hover_index != -1) {
+				this->hover_index = -1;
+				this->SetWidgetDirty(WID_CL_MATRIX);
+			}
+		} else {
+			int index = this->GetRowFromWidget(pt.y, widget, 0, -1);
+			if (index != this->hover_index) {
+				this->hover_index = index;
+				this->SetWidgetDirty(WID_CL_MATRIX);
+			}
 		}
 	}
 };
@@ -2411,62 +2173,79 @@ struct NetworkJoinStatusWindow : Window {
 
 	void DrawWidget(const Rect &r, int widget) const override
 	{
-		if (widget != WID_NJS_BACKGROUND) return;
+		switch (widget) {
+			case WID_NJS_PROGRESS_BAR: {
+				/* Draw the % complete with a bar and a text */
+				DrawFrameRect(r, COLOUR_GREY, FR_BORDERONLY | FR_LOWERED);
+				Rect ir = r.Shrink(WidgetDimensions::scaled.bevel);
+				uint8 progress; // used for progress bar
+				switch (_network_join_status) {
+					case NETWORK_JOIN_STATUS_CONNECTING:
+					case NETWORK_JOIN_STATUS_AUTHORIZING:
+					case NETWORK_JOIN_STATUS_GETTING_COMPANY_INFO:
+						progress = 10; // first two stages 10%
+						break;
+					case NETWORK_JOIN_STATUS_WAITING:
+						progress = 15; // third stage is 15%
+						break;
+					case NETWORK_JOIN_STATUS_DOWNLOADING:
+						if (_network_join_bytes_total == 0) {
+							progress = 15; // We don't have the final size yet; the server is still compressing!
+							break;
+						}
+						FALLTHROUGH;
 
-		uint8 progress; // used for progress bar
-		DrawString(r.left + 2, r.right - 2, r.top + 20, STR_NETWORK_CONNECTING_1 + _network_join_status, TC_FROMSTRING, SA_HOR_CENTER);
-		switch (_network_join_status) {
-			case NETWORK_JOIN_STATUS_CONNECTING: case NETWORK_JOIN_STATUS_AUTHORIZING:
-			case NETWORK_JOIN_STATUS_GETTING_COMPANY_INFO:
-				progress = 10; // first two stages 10%
-				break;
-			case NETWORK_JOIN_STATUS_WAITING:
-				SetDParam(0, _network_join_waiting);
-				DrawString(r.left + 2, r.right - 2, r.top + 20 + FONT_HEIGHT_NORMAL, STR_NETWORK_CONNECTING_WAITING, TC_FROMSTRING, SA_HOR_CENTER);
-				progress = 15; // third stage is 15%
-				break;
-			case NETWORK_JOIN_STATUS_DOWNLOADING:
-				SetDParam(0, _network_join_bytes);
-				SetDParam(1, _network_join_bytes_total);
-				DrawString(r.left + 2, r.right - 2, r.top + 20 + FONT_HEIGHT_NORMAL, _network_join_bytes_total == 0 ? STR_NETWORK_CONNECTING_DOWNLOADING_1 : STR_NETWORK_CONNECTING_DOWNLOADING_2, TC_FROMSTRING, SA_HOR_CENTER);
-				if (_network_join_bytes_total == 0) {
-					progress = 15; // We don't have the final size yet; the server is still compressing!
-					break;
+					default: // Waiting is 15%, so the resting receivement of map is maximum 70%
+						progress = 15 + _network_join_bytes * (100 - 15) / _network_join_bytes_total;
+						break;
 				}
-				FALLTHROUGH;
+				DrawFrameRect(ir.WithWidth(ir.Width() * progress / 100, false), COLOUR_MAUVE, FR_NONE);
+				DrawString(ir.left, ir.right, CenterBounds(ir.top, ir.bottom, FONT_HEIGHT_NORMAL), STR_NETWORK_CONNECTING_1 + _network_join_status, TC_FROMSTRING, SA_HOR_CENTER);
+				break;
+			}
 
-			default: // Waiting is 15%, so the resting receivement of map is maximum 70%
-				progress = 15 + _network_join_bytes * (100 - 15) / _network_join_bytes_total;
+			case WID_NJS_PROGRESS_TEXT:
+				switch (_network_join_status) {
+					case NETWORK_JOIN_STATUS_WAITING:
+						SetDParam(0, _network_join_waiting);
+						DrawStringMultiLine(r, STR_NETWORK_CONNECTING_WAITING, TC_FROMSTRING, SA_CENTER);
+						break;
+					case NETWORK_JOIN_STATUS_DOWNLOADING:
+						SetDParam(0, _network_join_bytes);
+						SetDParam(1, _network_join_bytes_total);
+						DrawStringMultiLine(r, _network_join_bytes_total == 0 ? STR_NETWORK_CONNECTING_DOWNLOADING_1 : STR_NETWORK_CONNECTING_DOWNLOADING_2, TC_FROMSTRING, SA_CENTER);
+						break;
+					default:
+						break;
+				}
+				break;
 		}
-
-		/* Draw nice progress bar :) */
-		DrawFrameRect(r.left + 20, r.top + 5, (int)((this->width - 20) * progress / 100), r.top + 15, COLOUR_MAUVE, FR_NONE);
 	}
 
 	void UpdateWidgetSize(int widget, Dimension *size, const Dimension &padding, Dimension *fill, Dimension *resize) override
 	{
-		if (widget != WID_NJS_BACKGROUND) return;
+		switch (widget) {
+			case WID_NJS_PROGRESS_BAR:
+				/* Account for the statuses */
+				for (uint i = 0; i < NETWORK_JOIN_STATUS_END; i++) {
+					*size = maxdim(*size, GetStringBoundingBox(STR_NETWORK_CONNECTING_1 + i));
+				}
+				/* For the number of waiting (other) players */
+				SetDParamMaxValue(0, MAX_CLIENTS);
+				*size = maxdim(*size, GetStringBoundingBox(STR_NETWORK_CONNECTING_WAITING));
+				/* We need some spacing for the 'border' */
+				size->height += WidgetDimensions::scaled.frametext.Horizontal();
+				size->width  += WidgetDimensions::scaled.frametext.Vertical();
+				break;
 
-		size->height = 25 + 2 * FONT_HEIGHT_NORMAL;
-
-		/* Account for the statuses */
-		uint width = 0;
-		for (uint i = 0; i < NETWORK_JOIN_STATUS_END; i++) {
-			width = std::max(width, GetStringBoundingBox(STR_NETWORK_CONNECTING_1 + i).width);
+			case WID_NJS_PROGRESS_TEXT:
+				/* Account for downloading ~ 10 MiB */
+				SetDParamMaxDigits(0, 8);
+				SetDParamMaxDigits(1, 8);
+				*size = maxdim(*size, GetStringBoundingBox(STR_NETWORK_CONNECTING_DOWNLOADING_1));
+				*size = maxdim(*size, GetStringBoundingBox(STR_NETWORK_CONNECTING_DOWNLOADING_1));
+				break;
 		}
-
-		/* For the number of waiting (other) players */
-		SetDParamMaxValue(0, MAX_CLIENTS);
-		width = std::max(width, GetStringBoundingBox(STR_NETWORK_CONNECTING_WAITING).width);
-
-		/* Account for downloading ~ 10 MiB */
-		SetDParamMaxDigits(0, 8);
-		SetDParamMaxDigits(1, 8);
-		width = std::max(width, GetStringBoundingBox(STR_NETWORK_CONNECTING_DOWNLOADING_1).width);
-		width = std::max(width, GetStringBoundingBox(STR_NETWORK_CONNECTING_DOWNLOADING_2).width);
-
-		/* Give a bit more clearing for the widest strings than strictly needed */
-		size->width = width + WD_FRAMERECT_LEFT + WD_FRAMERECT_BOTTOM + 10;
 	}
 
 	void OnClick(Point pt, int widget, int click_count) override
@@ -2482,7 +2261,6 @@ struct NetworkJoinStatusWindow : Window {
 	{
 		if (StrEmpty(str)) {
 			NetworkDisconnect();
-			ShowNetworkGameWindow();
 			return;
 		}
 
@@ -2497,13 +2275,11 @@ struct NetworkJoinStatusWindow : Window {
 static const NWidgetPart _nested_network_join_status_window_widgets[] = {
 	NWidget(WWT_CAPTION, COLOUR_GREY), SetDataTip(STR_NETWORK_CONNECTING_CAPTION, STR_TOOLTIP_WINDOW_TITLE_DRAG_THIS),
 	NWidget(WWT_PANEL, COLOUR_GREY),
-		NWidget(WWT_EMPTY, COLOUR_GREY, WID_NJS_BACKGROUND),
-		NWidget(NWID_HORIZONTAL),
-			NWidget(NWID_SPACER), SetMinimalSize(75, 0), SetFill(1, 0),
-			NWidget(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NJS_CANCELOK), SetMinimalSize(101, 12), SetDataTip(STR_NETWORK_CONNECTION_DISCONNECT, STR_NULL),
-			NWidget(NWID_SPACER), SetMinimalSize(75, 0), SetFill(1, 0),
+		NWidget(NWID_VERTICAL), SetPIP(0, WidgetDimensions::unscaled.vsep_wide, 0), SetPadding(WidgetDimensions::unscaled.modalpopup),
+			NWidget(WWT_EMPTY, INVALID_COLOUR, WID_NJS_PROGRESS_BAR), SetFill(1, 0),
+			NWidget(WWT_EMPTY, INVALID_COLOUR, WID_NJS_PROGRESS_TEXT), SetFill(1, 0), SetMinimalSize(350, 0),
+			NWidget(WWT_PUSHTXTBTN, COLOUR_WHITE, WID_NJS_CANCELOK), SetMinimalSize(101, 12), SetDataTip(STR_NETWORK_CONNECTION_DISCONNECT, STR_NULL), SetFill(1, 0),
 		EndContainer(),
-		NWidget(NWID_SPACER), SetMinimalSize(0, 4),
 	EndContainer(),
 };
 
@@ -2516,7 +2292,7 @@ static WindowDesc _network_join_status_window_desc(
 
 void ShowJoinStatusWindow()
 {
-	DeleteWindowById(WC_NETWORK_STATUS_WINDOW, WN_NETWORK_STATUS_WINDOW_JOIN);
+	CloseWindowById(WC_NETWORK_STATUS_WINDOW, WN_NETWORK_STATUS_WINDOW_JOIN);
 	new NetworkJoinStatusWindow(&_network_join_status_window_desc);
 }
 
@@ -2554,9 +2330,9 @@ struct NetworkCompanyPasswordWindow : public Window {
 	void UpdateWarningStringSize()
 	{
 		assert(this->nested_root->smallest_x > 0);
-		this->warning_size.width = this->nested_root->current_x - (WD_FRAMETEXT_LEFT + WD_FRAMETEXT_RIGHT + WD_FRAMERECT_LEFT + WD_FRAMERECT_RIGHT);
+		this->warning_size.width = this->nested_root->current_x - (WidgetDimensions::scaled.framerect.Horizontal()) * 2;
 		this->warning_size.height = GetStringHeight(STR_WARNING_PASSWORD_SECURITY, this->warning_size.width);
-		this->warning_size.height += WD_FRAMETEXT_TOP + WD_FRAMETEXT_BOTTOM + WD_FRAMERECT_TOP + WD_FRAMERECT_BOTTOM;
+		this->warning_size.height += (WidgetDimensions::scaled.framerect.Vertical()) * 2;
 
 		this->ReInit();
 	}
@@ -2572,15 +2348,14 @@ struct NetworkCompanyPasswordWindow : public Window {
 	{
 		if (widget != WID_NCP_WARNING) return;
 
-		DrawStringMultiLine(r.left + WD_FRAMETEXT_LEFT, r.right - WD_FRAMETEXT_RIGHT,
-			r.top + WD_FRAMERECT_TOP, r.bottom - WD_FRAMERECT_BOTTOM,
+		DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.framerect),
 			STR_WARNING_PASSWORD_SECURITY, TC_FROMSTRING, SA_CENTER);
 	}
 
 	void OnOk()
 	{
 		if (this->IsWidgetLowered(WID_NCP_SAVE_AS_DEFAULT_PASSWORD)) {
-			strecpy(_settings_client.network.default_company_pass, this->password_editbox.text.buf, lastof(_settings_client.network.default_company_pass));
+			_settings_client.network.default_company_pass = this->password_editbox.text.buf;
 		}
 
 		NetworkChangeCompanyPassword(_local_company, this->password_editbox.text.buf);
@@ -2594,7 +2369,7 @@ struct NetworkCompanyPasswordWindow : public Window {
 				FALLTHROUGH;
 
 			case WID_NCP_CANCEL:
-				delete this;
+				this->Close();
 				break;
 
 			case WID_NCP_SAVE_AS_DEFAULT_PASSWORD:
@@ -2639,7 +2414,116 @@ static WindowDesc _network_company_password_window_desc(
 
 void ShowNetworkCompanyPasswordWindow(Window *parent)
 {
-	DeleteWindowById(WC_COMPANY_PASSWORD_WINDOW, 0);
+	CloseWindowById(WC_COMPANY_PASSWORD_WINDOW, 0);
 
 	new NetworkCompanyPasswordWindow(&_network_company_password_window_desc, parent);
+}
+
+/**
+ * Window used for asking the user if he is okay using a relay server.
+ */
+struct NetworkAskRelayWindow : public Window {
+	std::string server_connection_string; ///< The game server we want to connect to.
+	std::string relay_connection_string;  ///< The relay server we want to connect to.
+	std::string token;                    ///< The token for this connection.
+
+	NetworkAskRelayWindow(WindowDesc *desc, Window *parent, const std::string &server_connection_string, const std::string &relay_connection_string, const std::string &token) :
+		Window(desc),
+		server_connection_string(server_connection_string),
+		relay_connection_string(relay_connection_string),
+		token(token)
+	{
+		this->parent = parent;
+		this->InitNested(0);
+	}
+
+	void UpdateWidgetSize(int widget, Dimension *size, const Dimension &padding, Dimension *fill, Dimension *resize) override
+	{
+		if (widget == WID_NAR_TEXT) {
+			*size = GetStringBoundingBox(STR_NETWORK_ASK_RELAY_TEXT);
+			size->height = GetStringHeight(STR_NETWORK_ASK_RELAY_TEXT, size->width - WidgetDimensions::scaled.frametext.Horizontal()) + WidgetDimensions::scaled.frametext.Vertical();
+		}
+	}
+
+	void DrawWidget(const Rect &r, int widget) const override
+	{
+		if (widget == WID_NAR_TEXT) {
+			DrawStringMultiLine(r.Shrink(WidgetDimensions::scaled.frametext), STR_NETWORK_ASK_RELAY_TEXT, TC_FROMSTRING, SA_CENTER);
+		}
+	}
+
+	void FindWindowPlacementAndResize(int def_width, int def_height) override
+	{
+		/* Position query window over the calling window, ensuring it's within screen bounds. */
+		this->left = Clamp(parent->left + (parent->width / 2) - (this->width / 2), 0, _screen.width - this->width);
+		this->top = Clamp(parent->top + (parent->height / 2) - (this->height / 2), 0, _screen.height - this->height);
+		this->SetDirty();
+	}
+
+	void SetStringParameters(int widget) const override
+	{
+		switch (widget) {
+			case WID_NAR_TEXT:
+				SetDParamStr(0, this->server_connection_string);
+				SetDParamStr(1, this->relay_connection_string);
+				break;
+		}
+	}
+
+	void OnClick(Point pt, int widget, int click_count) override
+	{
+		switch (widget) {
+			case WID_NAR_NO:
+				_network_coordinator_client.ConnectFailure(this->token, 0);
+				this->Close();
+				break;
+
+			case WID_NAR_YES_ONCE:
+				_network_coordinator_client.StartTurnConnection(this->token);
+				this->Close();
+				break;
+
+			case WID_NAR_YES_ALWAYS:
+				_settings_client.network.use_relay_service = URS_ALLOW;
+				_network_coordinator_client.StartTurnConnection(this->token);
+				this->Close();
+				break;
+		}
+	}
+};
+
+static const NWidgetPart _nested_network_ask_relay_widgets[] = {
+	NWidget(NWID_HORIZONTAL),
+		NWidget(WWT_CLOSEBOX, COLOUR_RED),
+		NWidget(WWT_CAPTION, COLOUR_RED, WID_NAR_CAPTION), SetDataTip(STR_NETWORK_ASK_RELAY_CAPTION, STR_NULL),
+	EndContainer(),
+	NWidget(WWT_PANEL, COLOUR_RED), SetPIP(0, 0, 8),
+		NWidget(WWT_TEXT, COLOUR_RED, WID_NAR_TEXT), SetAlignment(SA_HOR_CENTER), SetFill(1, 1),
+		NWidget(NWID_HORIZONTAL, NC_EQUALSIZE), SetPIP(10, 15, 10),
+			NWidget(WWT_PUSHTXTBTN, COLOUR_YELLOW, WID_NAR_NO), SetMinimalSize(71, 12), SetFill(1, 1), SetDataTip(STR_NETWORK_ASK_RELAY_NO, STR_NULL),
+			NWidget(WWT_PUSHTXTBTN, COLOUR_YELLOW, WID_NAR_YES_ONCE), SetMinimalSize(71, 12), SetFill(1, 1), SetDataTip(STR_NETWORK_ASK_RELAY_YES_ONCE, STR_NULL),
+			NWidget(WWT_PUSHTXTBTN, COLOUR_YELLOW, WID_NAR_YES_ALWAYS), SetMinimalSize(71, 12), SetFill(1, 1), SetDataTip(STR_NETWORK_ASK_RELAY_YES_ALWAYS, STR_NULL),
+		EndContainer(),
+	EndContainer(),
+};
+
+static WindowDesc _network_ask_relay_desc(
+	WDP_CENTER, nullptr, 0, 0,
+	WC_NETWORK_ASK_RELAY, WC_NONE,
+	WDF_MODAL,
+	_nested_network_ask_relay_widgets, lengthof(_nested_network_ask_relay_widgets)
+);
+
+/**
+ * Show a modal confirmation window with "no" / "yes, once" / "yes, always" buttons.
+ * @param server_connection_string The game server we want to connect to.
+ * @param relay_connection_string The relay server we want to connect to.
+ * @param token The token for this connection.
+ */
+void ShowNetworkAskRelay(const std::string &server_connection_string, const std::string &relay_connection_string, const std::string &token)
+{
+	CloseWindowByClass(WC_NETWORK_ASK_RELAY);
+
+	Window *parent = FindWindowById(WC_MAIN_WINDOW, 0);
+	new NetworkAskRelayWindow(&_network_ask_relay_desc, parent, server_connection_string, relay_connection_string, token);
 }

@@ -13,6 +13,7 @@
 /** %Window numbers. */
 enum WindowNumberEnum {
 	WN_GAME_OPTIONS_AI = 0,          ///< AI settings.
+	WN_GAME_OPTIONS_GS,              ///< GS settings.
 	WN_GAME_OPTIONS_ABOUT,           ///< About window.
 	WN_GAME_OPTIONS_NEWGRF_STATE,    ///< NewGRF settings.
 	WN_GAME_OPTIONS_GAME_OPTIONS,    ///< Game options.
@@ -25,7 +26,6 @@ enum WindowNumberEnum {
 	WN_CONFIRM_POPUP_QUERY_BOOTSTRAP, ///< Query popup confirm for bootstrap.
 
 	WN_NETWORK_WINDOW_GAME = 0,     ///< Network game window.
-	WN_NETWORK_WINDOW_LOBBY,        ///< Network lobby window.
 	WN_NETWORK_WINDOW_CONTENT_LIST, ///< Network content list.
 	WN_NETWORK_WINDOW_START,        ///< Network start server.
 
@@ -472,7 +472,6 @@ enum WindowClass {
 	/**
 	 * Network window; %Window numbers:
 	 *   - #WN_NETWORK_WINDOW_GAME = #NetworkGameWidgets
-	 *   - #WN_NETWORK_WINDOW_LOBBY = #NetworkLobbyWidgets
 	 *   - #WN_NETWORK_WINDOW_CONTENT_LIST = #NetworkContentListWidgets
 	 *   - #WN_NETWORK_WINDOW_START = #NetworkStartServerWidgets
 	 */
@@ -490,6 +489,12 @@ enum WindowClass {
 	 *   - #WN_NETWORK_STATUS_WINDOW_CONTENT_DOWNLOAD = #NetworkContentDownloadStatusWidgets
 	 */
 	WC_NETWORK_STATUS_WINDOW,
+
+	/**
+	 * Network ask relay window; %Window numbers:
+	 *   - 0 - #NetworkAskRelayWidgets
+	 */
+	WC_NETWORK_ASK_RELAY,
 
 	/**
 	 * Chatbox; %Window numbers:
@@ -605,6 +610,7 @@ enum WindowClass {
 	/**
 	 * Game options window; %Window numbers:
 	 *   - #WN_GAME_OPTIONS_AI = #AIConfigWidgets
+	 *   - #WN_GAME_OPTIONS_GS = #GSConfigWidgets
 	 *   - #WN_GAME_OPTIONS_ABOUT = #AboutWidgets
 	 *   - #WN_GAME_OPTIONS_NEWGRF_STATE = #NewGRFStateWidgets
 	 *   - #WN_GAME_OPTIONS_GAME_OPTIONS = #GameOptionsWidgets

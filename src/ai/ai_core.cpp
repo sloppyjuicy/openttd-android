@@ -57,6 +57,8 @@
 	assert(c->ai_instance == nullptr);
 	c->ai_instance = new AIInstance();
 	c->ai_instance->Initialize(info);
+	c->ai_instance->LoadOnStack(config->GetToLoadData());
+	config->SetToLoadData(nullptr);
 
 	cur_company.Restore();
 
@@ -114,7 +116,7 @@
 	cur_company.Restore();
 
 	InvalidateWindowData(WC_AI_DEBUG, 0, -1);
-	DeleteWindowById(WC_AI_SETTINGS, company);
+	CloseWindowById(WC_AI_SETTINGS, company);
 }
 
 /* static */ void AI::Pause(CompanyID company)
@@ -207,7 +209,7 @@
 	for (CompanyID c = COMPANY_FIRST; c < MAX_COMPANIES; c++) {
 		if (_settings_game.ai_config[c] != nullptr && _settings_game.ai_config[c]->HasScript()) {
 			if (!_settings_game.ai_config[c]->ResetInfo(true)) {
-				DEBUG(script, 0, "After a reload, the AI by the name '%s' was no longer found, and removed from the list.", _settings_game.ai_config[c]->GetName());
+				Debug(script, 0, "After a reload, the AI by the name '{}' was no longer found, and removed from the list.", _settings_game.ai_config[c]->GetName());
 				_settings_game.ai_config[c]->Change(nullptr);
 				if (Company::IsValidAiID(c)) {
 					/* The code belonging to an already running AI was deleted. We can only do
@@ -224,7 +226,7 @@
 		}
 		if (_settings_newgame.ai_config[c] != nullptr && _settings_newgame.ai_config[c]->HasScript()) {
 			if (!_settings_newgame.ai_config[c]->ResetInfo(false)) {
-				DEBUG(script, 0, "After a reload, the AI by the name '%s' was no longer found, and removed from the list.", _settings_newgame.ai_config[c]->GetName());
+				Debug(script, 0, "After a reload, the AI by the name '{}' was no longer found, and removed from the list.", _settings_newgame.ai_config[c]->GetName());
 				_settings_newgame.ai_config[c]->Change(nullptr);
 			}
 		}
@@ -289,21 +291,6 @@
 	}
 }
 
-/* static */ void AI::Load(CompanyID company, int version)
-{
-	if (!_networking || _network_server) {
-		Company *c = Company::GetIfValid(company);
-		assert(c != nullptr && c->ai_instance != nullptr);
-
-		Backup<CompanyID> cur_company(_current_company, company, FILE_LINE);
-		c->ai_instance->Load(version);
-		cur_company.Restore();
-	} else {
-		/* Read, but ignore, the load data */
-		AIInstance::LoadEmpty();
-	}
-}
-
 /* static */ int AI::GetStartNextTime()
 {
 	/* Find the first company which doesn't exist yet */
@@ -315,14 +302,14 @@
 	return DAYS_IN_YEAR;
 }
 
-/* static */ char *AI::GetConsoleList(char *p, const char *last, bool newest_only)
+/* static */ std::string AI::GetConsoleList(bool newest_only)
 {
-	return AI::scanner_info->GetConsoleList(p, last, newest_only);
+	return AI::scanner_info->GetConsoleList(newest_only);
 }
 
-/* static */ char *AI::GetConsoleLibraryList(char *p, const char *last)
+/* static */ std::string AI::GetConsoleLibraryList()
 {
-	 return AI::scanner_library->GetConsoleList(p, last, true);
+	 return AI::scanner_library->GetConsoleList(true);
 }
 
 /* static */ const ScriptInfoList *AI::GetInfoList()

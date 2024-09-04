@@ -24,6 +24,7 @@
 #include "../string_func.h"
 #include "../date_func.h"
 #include "../roadveh.h"
+#include "../roadveh_cmd.h"
 #include "../train.h"
 #include "../station_base.h"
 #include "../waypoint_base.h"
@@ -40,6 +41,7 @@
 #include "../road_cmd.h"
 #include "../ai/ai.hpp"
 #include "../ai/ai_gui.hpp"
+#include "../game/game.hpp"
 #include "../town.h"
 #include "../economy_base.h"
 #include "../animated_tile_func.h"
@@ -56,7 +58,6 @@
 #include "../disaster_vehicle.h"
 #include "../ship.h"
 #include "../water.h"
-
 
 #include "saveload_internal.h"
 
@@ -179,7 +180,7 @@ static void UpdateExclusiveRights()
 	 *     Build an array town_blocked[ town_id ][ company_id ]
 	 *     that stores if at least one station in that town is blocked for a company
 	 * 2.) Go through that array, if you find a town that is not blocked for
-	 *     one company, but for all others, then give him exclusivity.
+	 *     one company, but for all others, then give it exclusivity.
 	 */
 }
 
@@ -302,7 +303,6 @@ static void InitializeWindowsAndCaches()
 
 	CheckTrainsLengths();
 	ShowNewGRFError();
-	ShowAIDebugWindowIfAIError();
 
 	/* Rebuild the smallmap list of owners. */
 	BuildOwnerLegend();
@@ -393,8 +393,8 @@ static void CDECL HandleSavegameLoadCrash(int signum)
 			"or older version.\n"
 			"It will load a NewGRF with the same GRF ID as the missing NewGRF.\n"
 			"This means that if the author makes incompatible NewGRFs with the\n"
-			"same GRF ID OpenTTD cannot magically do the right thing. In most\n"
-			"cases OpenTTD will load the savegame and not crash, but this is an\n"
+			"same GRF ID, OpenTTD cannot magically do the right thing. In most\n"
+			"cases, OpenTTD will load the savegame and not crash, but this is an\n"
 			"exception.\n"
 			"Please load the savegame with the appropriate NewGRFs installed.\n"
 			"The missing/compatible NewGRFs are:\n");
@@ -402,9 +402,11 @@ static void CDECL HandleSavegameLoadCrash(int signum)
 		for (const GRFConfig *c = _grfconfig; c != nullptr; c = c->next) {
 			if (HasBit(c->flags, GCF_COMPATIBLE)) {
 				const GRFIdentifier *replaced = GetOverriddenIdentifier(c);
-				char buf[40];
-				md5sumToString(buf, lastof(buf), replaced->md5sum);
-				p += seprintf(p, lastof(buffer), "NewGRF %08X (checksum %s) not found.\n  Loaded NewGRF \"%s\" with same GRF ID instead.\n", BSWAP32(c->ident.grfid), buf, c->filename);
+				char original_md5[40];
+				char replaced_md5[40];
+				md5sumToString(original_md5, lastof(original_md5), c->original_md5sum);
+				md5sumToString(replaced_md5, lastof(replaced_md5), replaced->md5sum);
+				p += seprintf(p, lastof(buffer), "NewGRF %08X (checksum %s) not found.\n  Loaded NewGRF \"%s\" (checksum %s) with same GRF ID instead.\n", BSWAP32(c->ident.grfid), original_md5, c->filename, replaced_md5);
 			}
 			if (c->status == GCS_NOT_FOUND) {
 				char buf[40];
@@ -536,6 +538,22 @@ static inline bool MayHaveBridgeAbove(TileIndex t)
 }
 
 /**
+ * Start the scripts.
+ */
+static void StartScripts()
+{
+	/* Start the GameScript. */
+	Game::StartNew();
+
+	/* Start the AIs. */
+	for (const Company *c : Company::Iterate()) {
+		if (Company::IsValidAiID(c->index)) AI::StartNew(c->index, false);
+	}
+
+	ShowAIDebugWindowIfAIError();
+}
+
+/**
  * Perform a (large) amount of savegame conversion *magic* in order to
  * load older savegames and to fill the caches for various purposes.
  * @return True iff conversion went without a problem.
@@ -566,8 +584,8 @@ bool AfterLoadGame()
 	if (IsSavegameVersionBefore(SLV_119)) {
 		_pause_mode = (_pause_mode == 2) ? PM_PAUSED_NORMAL : PM_UNPAUSED;
 	} else if (_network_dedicated && (_pause_mode & PM_PAUSED_ERROR) != 0) {
-		DEBUG(net, 0, "The loading savegame was paused due to an error state.");
-		DEBUG(net, 0, "  The savegame cannot be used for multiplayer!");
+		Debug(net, 0, "The loading savegame was paused due to an error state");
+		Debug(net, 0, "  This savegame cannot be used for multiplayer");
 		/* Restore the signals */
 		ResetSignalHandlers();
 		return false;
@@ -731,7 +749,7 @@ bool AfterLoadGame()
 	if (IsSavegameVersionBefore(SLV_6, 1)) _settings_game.pf.forbid_90_deg = false;
 	if (IsSavegameVersionBefore(SLV_21))   _settings_game.vehicle.train_acceleration_model = 0;
 	if (IsSavegameVersionBefore(SLV_90))   _settings_game.vehicle.plane_speed = 4;
-	if (IsSavegameVersionBefore(SLV_95))   _settings_game.vehicle.dynamic_engines = 0;
+	if (IsSavegameVersionBefore(SLV_95))   _settings_game.vehicle.dynamic_engines = false;
 	if (IsSavegameVersionBefore(SLV_96))   _settings_game.economy.station_noise_level = false;
 	if (IsSavegameVersionBefore(SLV_133)) {
 		_settings_game.vehicle.train_slope_steepness = 3;
@@ -796,13 +814,6 @@ bool AfterLoadGame()
 	/* Update all vehicles */
 	AfterLoadVehicles(true);
 
-	/* Make sure there is an AI attached to an AI company */
-	{
-		for (const Company *c : Company::Iterate()) {
-			if (c->is_ai && c->ai_instance == nullptr) AI::StartNew(c->index);
-		}
-	}
-
 	/* make sure there is a town in the game */
 	if (_game_mode == GM_NORMAL && Town::GetNumItems() == 0) {
 		SetSaveLoadError(STR_ERROR_NO_TOWN_IN_SCENARIO);
@@ -821,10 +832,12 @@ bool AfterLoadGame()
 	 *  a company does not exist yet. So create one here.
 	 * 1 exception: network-games. Those can have 0 companies
 	 *   But this exception is not true for non-dedicated network servers! */
-	if (!Company::IsValidID(COMPANY_FIRST) && (!_networking || (_networking && _network_server && !_network_dedicated))) {
-		DoStartupNewCompany(false);
-		Company *c = Company::Get(COMPANY_FIRST);
-		c->settings = _settings_client.company;
+	if (!_networking || (_networking && _network_server && !_network_dedicated)) {
+		CompanyID first_human_company = GetFirstPlayableCompanyID();
+		if (!Company::IsValidID(first_human_company)) {
+			Company *c = DoStartupNewCompany(false, first_human_company);
+			c->settings = _settings_client.company;
+		}
 	}
 
 	/* Fix the cache for cargo payments. */
@@ -955,10 +968,6 @@ bool AfterLoadGame()
 		}
 	}
 
-	/* In version 2.2 of the savegame, we have new airports, so status of all aircraft is reset.
-	 * This has to be called after the oilrig airport_type update above ^^^ ! */
-	if (IsSavegameVersionBefore(SLV_2, 2)) UpdateOldAircraft();
-
 	/* In version 6.1 we put the town index in the map-array. To do this, we need
 	 *  to use m2 (16bit big), so we need to clean m2, and that is where this is
 	 *  all about ;) */
@@ -1008,10 +1017,10 @@ bool AfterLoadGame()
 		/* When loading a game, _local_company is not yet set to the correct value.
 		 * However, in a dedicated server we are a spectator, so nothing needs to
 		 * happen. In case we are not a dedicated server, the local company always
-		 * becomes company 0, unless we are in the scenario editor where all the
-		 * companies are 'invalid'.
+		 * becomes the first available company, unless we are in the scenario editor
+		 * where all the companies are 'invalid'.
 		 */
-		Company *c = Company::GetIfValid(COMPANY_FIRST);
+		Company *c = Company::GetIfValid(GetFirstPlayableCompanyID());
 		if (!_network_dedicated && c != nullptr) {
 			c->settings = _settings_client.company;
 		}
@@ -1413,7 +1422,7 @@ bool AfterLoadGame()
 		c->avail_roadtypes = GetCompanyRoadTypes(c->index);
 	}
 
-	if (!IsSavegameVersionBefore(SLV_27)) AfterLoadStations();
+	AfterLoadStations();
 
 	/* Time starts at 0 instead of 1920.
 	 * Account for this in older games by adding an offset */
@@ -1722,9 +1731,9 @@ bool AfterLoadGame()
 		for (Order *order : Order::Iterate()) order->ConvertFromOldSavegame();
 
 		for (Vehicle *v : Vehicle::Iterate()) {
-			if (v->orders.list != nullptr && v->orders.list->GetFirstOrder() != nullptr && v->orders.list->GetFirstOrder()->IsType(OT_NOTHING)) {
-				v->orders.list->FreeChain();
-				v->orders.list = nullptr;
+			if (v->orders != nullptr && v->orders->GetFirstOrder() != nullptr && v->orders->GetFirstOrder()->IsType(OT_NOTHING)) {
+				v->orders->FreeChain();
+				v->orders = nullptr;
 			}
 
 			v->current_order.ConvertFromOldSavegame();
@@ -1757,10 +1766,9 @@ bool AfterLoadGame()
 		 * 2) shares that are owned by inactive companies or self
 		 *     (caused by cheating clients in earlier revisions) */
 		for (Company *c : Company::Iterate()) {
-			for (uint i = 0; i < 4; i++) {
-				CompanyID company = c->share_owners[i];
-				if (company == INVALID_COMPANY) continue;
-				if (!Company::IsValidID(company) || company == c->index) c->share_owners[i] = INVALID_COMPANY;
+			for (auto &share_owner : c->share_owners) {
+				if (share_owner == INVALID_COMPANY) continue;
+				if (!Company::IsValidID(share_owner) || share_owner == c->index) share_owner = INVALID_COMPANY;
 			}
 		}
 	}
@@ -1855,7 +1863,7 @@ bool AfterLoadGame()
 				}
 			} else if (IsTileType(t, MP_ROAD)) {
 				/* works for all RoadTileType */
-				FOR_ALL_ROADTRAMTYPES(rtt) {
+				for (RoadTramType rtt : _roadtramtypes) {
 					/* update even non-existing road types to update tile owner too */
 					Owner o = GetRoadOwner(t, rtt);
 					if (o < MAX_COMPANIES && !Company::IsValidID(o)) SetRoadOwner(t, rtt, OWNER_NONE);
@@ -2306,7 +2314,7 @@ bool AfterLoadGame()
 			/* At some point, invalid depots were saved into the game (possibly those removed in the past?)
 			 * Remove them here, so they don't cause issues further down the line */
 			if (!IsDepotTile(d->xy)) {
-				DEBUG(sl, 0, "Removing invalid depot %d at %d, %d", d->index, TileX(d->xy), TileY(d->xy));
+				Debug(sl, 0, "Removing invalid depot {} at {}, {}", d->index, TileX(d->xy), TileY(d->xy));
 				delete d;
 				d = nullptr;
 				continue;
@@ -2897,6 +2905,10 @@ bool AfterLoadGame()
 		}
 	}
 
+	/* In version 2.2 of the savegame, we have new airports, so status of all aircraft is reset.
+	 * This has to be called after all map array updates */
+	if (IsSavegameVersionBefore(SLV_2, 2)) UpdateOldAircraft();
+
 	if (IsSavegameVersionBefore(SLV_188)) {
 		/* Fix articulated road vehicles.
 		 * Some curves were shorter than other curves.
@@ -3104,14 +3116,14 @@ bool AfterLoadGame()
 		}
 	}
 
-	if (IsSavegameVersionUntil(SLV_ENDING_YEAR)) {
-		/* Update station docking tiles. Was only needed for pre-SLV_MULTITLE_DOCKS
-		 * savegames, but a bug in docking tiles touched all savegames between
-		 * SLV_MULTITILE_DOCKS and SLV_ENDING_YEAR. */
+	if (IsSavegameVersionBefore(SLV_REPAIR_OBJECT_DOCKING_TILES)) {
+		/* Placing objects on docking tiles was not updating adjacent station's docking tiles. */
 		for (Station *st : Station::Iterate()) {
 			if (st->ship_station.tile != INVALID_TILE) UpdateStationDockingTiles(st);
 		}
+	}
 
+	if (IsSavegameVersionBeforeOrAt(SLV_ENDING_YEAR)) {
 		/* Reset roadtype/streetcartype info for non-road bridges. */
 		for (TileIndex t = 0; t < map_size; t++) {
 			if (IsTileType(t, MP_TUNNELBRIDGE) && GetTunnelBridgeTransportType(t) != TRANSPORT_ROAD) {
@@ -3145,6 +3157,63 @@ bool AfterLoadGame()
 		}
 	}
 
+	/* Use current order time to approximate last loading time */
+	if (IsSavegameVersionBefore(SLV_LAST_LOADING_TICK)) {
+		for (Vehicle *v : Vehicle::Iterate()) {
+			v->last_loading_tick = std::max(_tick_counter, static_cast<uint64>(v->current_order_time)) - v->current_order_time;
+		}
+	}
+
+	/* Road stops is 'only' updating some caches, but they are needed for PF calls in SLV_MULTITRACK_LEVEL_CROSSINGS teleporting. */
+	AfterLoadRoadStops();
+
+	/* Road vehicles stopped on multitrack level crossings need teleporting to a depot
+	 * to avoid crashing into the side of the train they're waiting for. */
+	if (IsSavegameVersionBefore(SLV_MULTITRACK_LEVEL_CROSSINGS)) {
+		/* Teleport road vehicles to the nearest depot. */
+		for (RoadVehicle *rv : RoadVehicle::Iterate()) {
+			/* Ignore trailers of articulated vehicles. */
+			if (rv->IsArticulatedPart()) continue;
+
+			/* Ignore moving vehicles. */
+			if (rv->cur_speed > 0) continue;
+
+			/* Ignore crashed vehicles. */
+			if (rv->vehstatus & VS_CRASHED) continue;
+
+			/* Ignore vehicles not on level crossings. */
+			TileIndex cur_tile = rv->tile;
+			if (!IsLevelCrossingTile(cur_tile)) continue;
+
+			TileIndex location;
+			DestinationID destination;
+			bool reverse = true;
+
+			/* Try to find a depot with a distance limit of 512 tiles (Manhattan distance). */
+			if (rv->FindClosestDepot(&location, &destination, &reverse) && DistanceManhattan(rv->tile, location) < 512u) {
+				/* Teleport all parts of articulated vehicles. */
+				for (RoadVehicle *u = rv; u != nullptr; u = u->Next()) {
+					u->tile = location;
+					int x = TileX(location) * TILE_SIZE + TILE_SIZE / 2;
+					int y = TileY(location) * TILE_SIZE + TILE_SIZE / 2;
+					u->x_pos = x;
+					u->y_pos = y;
+					u->z_pos = GetSlopePixelZ(x, y);
+
+					u->vehstatus |= VS_HIDDEN;
+					u->state = RVSB_IN_DEPOT;
+					u->UpdatePosition();
+				}
+				RoadVehLeaveDepot(rv, false);
+			}
+		}
+
+		/* Refresh all level crossings to bar adjacent crossing tiles. */
+		for (TileIndex tile = 0; tile < MapSize(); tile++) {
+			if (IsLevelCrossingTile(tile)) UpdateLevelCrossing(tile, false, true);
+		}
+	}
+
 	/* Compute station catchment areas. This is needed here in case UpdateStationAcceptance is called below. */
 	Station::RecomputeCatchmentForAll();
 
@@ -3153,8 +3222,6 @@ bool AfterLoadGame()
 		for (Station *st : Station::Iterate()) UpdateStationAcceptance(st, false);
 	}
 
-	/* Road stops is 'only' updating some caches */
-	AfterLoadRoadStops();
 	AfterLoadLabelMaps();
 	AfterLoadCompanyStats();
 	AfterLoadStoryBook();
@@ -3166,6 +3233,10 @@ bool AfterLoadGame()
 	ResetSignalHandlers();
 
 	AfterLoadLinkGraphs();
+
+	/* Start the scripts. This MUST happen after everything else. */
+	StartScripts();
+
 	return true;
 }
 

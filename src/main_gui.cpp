@@ -35,6 +35,7 @@
 #include "news_gui.h"
 #include "tutorial_gui.h"
 #include "gui.h"
+#include "misc_cmd.h"
 
 #include "saveload/saveload.h"
 
@@ -78,7 +79,7 @@ bool HandlePlacePushButton(Window *w, int widget, CursorID cursor, HighLightStyl
 }
 
 
-void CcPlaySound_EXPLOSION(const CommandCost &result, TileIndex tile, uint32 p1, uint32 p2, uint32 cmd)
+void CcPlaySound_EXPLOSION(Commands cmd, const CommandCost &result, TileIndex tile)
 {
 	if (result.Succeeded() && _settings_client.sound.confirm) SndPlayTileFx(SND_12_EXPLOSION, tile);
 }
@@ -154,12 +155,24 @@ void ZoomInOrOutToCursorWindow(bool in, Window *w)
 	}
 }
 
-void FixTitleGameZoom()
+void FixTitleGameZoom(int zoom_adjust)
 {
 	if (_game_mode != GM_MENU) return;
 
 	Viewport *vp = FindWindowByClass(WC_MAIN_WINDOW)->viewport;
+
+	/* Adjust the zoom in/out.
+	 * Can't simply add, since operator+ is not defined on the ZoomLevel type. */
 	vp->zoom = _gui_zoom;
+	while (zoom_adjust < 0 && vp->zoom != _settings_client.gui.zoom_min) {
+		vp->zoom--;
+		zoom_adjust++;
+	}
+	while (zoom_adjust > 0 && vp->zoom != _settings_client.gui.zoom_max) {
+		vp->zoom++;
+		zoom_adjust--;
+	}
+
 	vp->virtual_width = ScaleByZoom(vp->width, vp->zoom);
 	vp->virtual_height = ScaleByZoom(vp->height, vp->zoom);
 }
@@ -211,7 +224,7 @@ struct MainWindow : Window
 		ResizeWindow(this, _screen.width, _screen.height);
 
 		NWidgetViewport *nvp = this->GetWidget<NWidgetViewport>(WID_M_VIEWPORT);
-		nvp->InitializeViewport(this, TileXY(32, 32), ZOOM_LVL_VIEWPORT);
+		nvp->InitializeViewport(this, TileXY(32, 32), ScaleZoomGUI(ZOOM_LVL_VIEWPORT));
 
 		this->viewport->overlay = new LinkGraphOverlay(this, WID_M_VIEWPORT, 0, 0, 3);
 		this->refresh.SetInterval(LINKGRAPH_DELAY);
@@ -237,8 +250,8 @@ struct MainWindow : Window
 		this->DrawWidgets();
 		if (_game_mode == GM_MENU) {
 			static const SpriteID title_sprites[] = {SPR_OTTD_O, SPR_OTTD_P, SPR_OTTD_E, SPR_OTTD_N, SPR_OTTD_T, SPR_OTTD_T, SPR_OTTD_D};
-			static const uint LETTER_SPACING = 10;
-			int name_width = (lengthof(title_sprites) - 1) * LETTER_SPACING;
+			uint letter_spacing = ScaleGUITrad(10);
+			int name_width = (lengthof(title_sprites) - 1) * letter_spacing;
 
 			for (uint i = 0; i < lengthof(title_sprites); i++) {
 				name_width += GetSpriteSize(title_sprites[i]).width;
@@ -246,8 +259,8 @@ struct MainWindow : Window
 			int off_x = (this->width - name_width) / 2;
 
 			for (uint i = 0; i < lengthof(title_sprites); i++) {
-				DrawSprite(title_sprites[i], PAL_NONE, off_x, 50);
-				off_x += GetSpriteSize(title_sprites[i]).width + LETTER_SPACING;
+				DrawSprite(title_sprites[i], PAL_NONE, off_x, ScaleGUITrad(50));
+				off_x += GetSpriteSize(title_sprites[i]).width + letter_spacing;
 			}
 		}
 	}
@@ -305,18 +318,18 @@ struct MainWindow : Window
 			}
 
 			case GHK_RESET_OBJECT_TO_PLACE: ResetObjectToPlace(); ToolbarSelectLastTool(); break;
-			case GHK_DELETE_WINDOWS: DeleteNonVitalWindows(); break;
-			case GHK_DELETE_NONVITAL_WINDOWS: DeleteAllNonVitalWindows(); break;
+			case GHK_DELETE_WINDOWS: CloseNonVitalWindows(); break;
+			case GHK_DELETE_NONVITAL_WINDOWS: CloseAllNonVitalWindows(); break;
 			case GHK_DELETE_ALL_MESSAGES: DeleteAllMessages(); break;
 			case GHK_REFRESH_SCREEN: MarkWholeScreenDirty(); break;
 
 			case GHK_CRASH: // Crash the game
-				*(volatile byte *)0 = 0;
+				*(volatile byte *)nullptr = 0;
 				break;
 
 			case GHK_MONEY: // Gimme money
 				/* You can only cheat for money in singleplayer mode. */
-				if (!_networking) DoCommandP(0, 10000000, 0, CMD_MONEY_CHEAT);
+				if (!_networking) Command<CMD_MONEY_CHEAT>::Post(10000000);
 				break;
 
 			case GHK_UPDATE_COORDS: // Update the coordinates of all station signs
@@ -422,6 +435,12 @@ struct MainWindow : Window
 			nvp->UpdateViewportCoordinates(this);
 			this->refresh.SetInterval(LINKGRAPH_DELAY);
 		}
+	}
+
+	bool OnTooltip(Point pt, int widget, TooltipCloseCondition close_cond) override
+	{
+		if (widget != WID_M_VIEWPORT) return false;
+		return this->viewport->overlay->ShowTooltip(pt, close_cond);
 	}
 
 	/**
@@ -535,6 +554,7 @@ void SetupColoursAndInitialWindow()
 		default: NOT_REACHED();
 		case GM_MENU:
 			ShowSelectGameWindow();
+            /* XXX: is this neeeded? */
 			ShowTutorialWindowOnceAfterInstall();
 			if (getenv("SDL_RESTART_PARAMS") != NULL) {
 				static int counter = 5; // This part of code is called several times during startup, which closes all windows, so we need to put random hacks here

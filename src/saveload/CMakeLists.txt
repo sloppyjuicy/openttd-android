@@ -1,3 +1,5 @@
+add_subdirectory(compat)
+
 add_files(
     afterload.cpp
     ai_sl.cpp
@@ -17,6 +19,7 @@ add_files(
     group_sl.cpp
     industry_sl.cpp
     labelmaps_sl.cpp
+    league_sl.cpp
     linkgraph_sl.cpp
     map_sl.cpp
     misc_sl.cpp
@@ -31,6 +34,7 @@ add_files(
     saveload.h
     saveload_filter.h
     saveload_internal.h
+    settings_sl.cpp
     signs_sl.cpp
     station_sl.cpp
     storage_sl.cpp
